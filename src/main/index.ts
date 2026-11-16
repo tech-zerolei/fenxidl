@@ -29,6 +29,34 @@ import { TaskManager } from './task-manager';
 // esbuild emits CommonJS for the main process, so __dirname is available.
 declare const __dirname: string;
 
+/**
+ * Chromium refuses to start as root unless the sandbox is disabled, aborting
+ * with "Running as root without --no-sandbox is not supported". A packaged
+ * AppImage launched by double-click passes no arguments, so the app would
+ * crash immediately for anyone running as root (containers, some VMs, and any
+ * session started via `sudo`).
+ *
+ * The switch has to be appended before the app is ready, so it is applied here
+ * at module scope. On a normal user account nothing changes: the sandbox stays
+ * on, because this only triggers when the effective uid is 0.
+ */
+function applyRootSandboxWorkaround(): void {
+  const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+  if (!isRoot) return;
+  if (app.commandLine.hasSwitch('no-sandbox')) return;
+  app.commandLine.appendSwitch('no-sandbox');
+  // Also disable the GPU sandbox; it is separate and fails the same way.
+  if (!app.commandLine.hasSwitch('disable-gpu-sandbox')) {
+    app.commandLine.appendSwitch('disable-gpu-sandbox');
+  }
+  console.warn(
+    '[FenxiDL] Running as root: the Chromium sandbox is disabled. ' +
+      'For best security, run the app as a regular user.',
+  );
+}
+
+applyRootSandboxWorkaround();
+
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
