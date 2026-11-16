@@ -23,11 +23,32 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-/** Locate the packaged Electron executable for the current platform. */
+/**
+ * Locate the packaged Electron executable for the current platform.
+ *
+ * The Linux binary is not named after `productName`: electron-builder derives it
+ * from the package `name` field (`fenxi-dl`) or from an explicit
+ * `build.linux.executableName`. Guessing a single candidate silently skipped
+ * fuse hardening on Linux, so every plausible name is tried and the result is
+ * verified to be a regular file.
+ */
 function executablePath(context) {
   const { electronPlatformName: platform, appOutDir, packager } = context;
+  if (platform === 'linux') {
+    const linux = packager.platformSpecificBuildOptions ?? {};
+    const candidates = [
+      linux.executableName,
+      packager.appInfo.sanitizedName,
+      packager.appInfo.productFilename.toLowerCase(),
+      packager.appInfo.productFilename,
+    ].filter(Boolean);
+    for (const name of new Set(candidates)) {
+      const candidate = path.join(appOutDir, name);
+      if (fs.existsSync(candidate)) return candidate;
+    }
+    return path.join(appOutDir, candidates[0] ?? 'app');
+  }
   const productName = packager.appInfo.productFilename;
-  if (platform === 'linux') return path.join(appOutDir, productName.toLowerCase());
   if (platform === 'win32') return path.join(appOutDir, `${productName}.exe`);
   if (platform === 'darwin') return path.join(appOutDir, `${productName}.app`, 'Contents', 'MacOS', productName);
   return null;
