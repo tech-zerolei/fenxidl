@@ -4,8 +4,8 @@
   "description": "FenxiDL - multi-connection segmented download manager",
   "main": "dist/main/index.js",
   "author": {
-    "name": "tech-zerolei",
-    "email": "tech-zerolei@users.noreply.github.com"
+    "name": "wanwen371",
+    "email": "wanwen371@users.noreply.github.com"
   },
   "license": "MIT",
   "engines": {
@@ -136,7 +136,7 @@
       "icon": "assets/icon.png",
       "synopsis": "高速多线程下载管理器",
       "description": "FenxiDL 是一个使用 Electron + TypeScript 构建的高速多线程下载管理器。",
-      "maintainer": "tech-zerolei <tech-zerolei@users.noreply.github.com>",
+      "maintainer": "wanwen371 <wanwen371@users.noreply.github.com>",
       "executableArgs": []
     },
     "extraResources": [
@@ -147,5 +147,5 @@
     ],
     "afterPack": "build/after-pack-linux.cjs"
   },
-  "homepage": "https://github.com/tech-zerolei/fenxidl"
+  "homepage": "https://github.com/wanwen371/fenxidl"
 }
