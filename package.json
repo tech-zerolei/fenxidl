@@ -3,7 +3,10 @@
   "version": "1.0.0",
   "description": "FenxiDL - multi-connection segmented download manager",
   "main": "dist/main/index.js",
-  "author": "FenxiDL Project",
+  "author": {
+    "name": "tech-zerolei",
+    "email": "tech-zerolei@users.noreply.github.com"
+  },
   "license": "MIT",
   "scripts": {
     "typecheck": "tsc --noEmit",
@@ -78,17 +81,45 @@
       "installerLanguages": [
         "zh_CN"
       ],
-      "language": "2052",
-      "license": "assets/LICENSE.txt"
+      "language": "2052"
     },
     "portable": {
       "artifactName": "${productName}-${version}-portable.${ext}"
     },
     "linux": {
       "target": [
-        "AppImage"
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "deb",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "dir",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
-      "category": "Network"
-    }
-  }
+      "category": "Network",
+      "icon": "assets/icon.png",
+      "synopsis": "高速多线程下载管理器",
+      "description": "FenxiDL 是一个使用 Electron + TypeScript 构建的高速多线程下载管理器。",
+      "maintainer": "tech-zerolei <tech-zerolei@users.noreply.github.com>"
+    },
+    "extraResources": [
+      {
+        "from": "assets/THIRD-PARTY-NOTICES.txt",
+        "to": "LICENSE-FenxiDL.txt"
+      }
+    ],
+    "afterPack": "build/after-pack-linux.cjs"
+  },
+  "homepage": "https://github.com/tech-zerolei/fenxidl"
 }

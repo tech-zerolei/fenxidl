@@ -29,7 +29,6 @@ import { TaskManager } from './task-manager';
 // esbuild emits CommonJS for the main process, so __dirname is available.
 declare const __dirname: string;
 
-const isDev = !app.isPackaged;
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
@@ -665,9 +664,26 @@ function createWindow(): void {
   });
 
   const indexPath = path.join(__dirname, '..', 'renderer', 'index.html');
-  void mainWindow.loadFile(indexPath);
+  // Verify the renderer actually loads inside an asar archive; a silent
+  // failure used to leave a blank white window with no diagnostic.
+  mainWindow.loadFile(indexPath).catch((err) => {
+    console.error('Failed to load the renderer via loadFile:', err);
+  });
+  mainWindow.webContents.on('did-fail-load', (_e, code, desc, url) => {
+    console.error(`Renderer failed to load: ${code} ${desc} ${url}`);
+  });
+  mainWindow.webContents.on('render-process-gone', (_e, details) => {
+    console.error('Renderer process gone:', details.reason);
+  });
+  mainWindow.webContents.on('console-message', (_e, level, message) => {
+    if (level >= 2) console.error(`RENDERER: ${message}`);
+  });
 
-  if (isDev) mainWindow.webContents.openDevTools({ mode: 'detach' });
+  // DevTools only when explicitly requested: auto-opening it covers the app
+  // window in development runs and makes screenshots look blank.
+  if (process.env.FENXI_DEVTOOLS === '1') {
+    mainWindow.webContents.openDevTools({ mode: 'detach' });
+  }
 }
 
 function createTray(): void {
