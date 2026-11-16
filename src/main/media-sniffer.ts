@@ -8,8 +8,10 @@
  * pasting a media URL) supplies the request URLs.
  */
 
+import * as crypto from 'node:crypto';
 import * as http from 'node:http';
 import { URL } from 'node:url';
+import { assertOutboundHostAllowed, isRecord } from './validate';
 
 export interface SniffedMedia {
   url: string;
@@ -148,88 +150,209 @@ export interface SnifferOptions {
   /** Called for every accepted report. */
   onMedia: (media: SniffedMedia) => void;
   onLog?: (message: string) => void;
+  /**
+   * Extension IDs allowed to post. When empty, any `chrome-extension://`
+   * origin is accepted (the shipped extension has no stable ID until a
+   * distributor pins one in the manifest); arbitrary web origins never are.
+   */
+  allowedExtensionIds?: string[];
+  /**
+   * Shared secret additionally required for requests that carry no
+   * `chrome-extension://` origin. Generated when omitted.
+   */
+  token?: string;
 }
 
 export interface SnifferHandle {
   port: number;
+  /** Shared secret accepted in the `X-Fenxi-Token` header. */
+  token: string;
   close: () => Promise<void>;
+}
+
+/** Reason a request was refused; used for logging and tests. */
+export type SnifferRejection =
+  | 'origin-not-allowed'
+  | 'token-required'
+  | 'token-invalid'
+  | 'blocked-host'
+  | 'invalid-json'
+  | 'invalid-url'
+  | 'body-too-large'
+  | 'not-found';
+
+function originOf(req: http.IncomingMessage): string {
+  const origin = req.headers.origin;
+  if (Array.isArray(origin)) return origin[0] ?? '';
+  return origin ?? '';
+}
+
+/**
+ * Classify an Origin header.
+ *
+ * `chrome-extension://<id>` is the only origin class that may write without a
+ * token: it is a locally installed extension. `null`, `file://` and a missing
+ * Origin all require the shared token. Every web origin is refused, which is
+ * what stops an arbitrary page from injecting forged media entries.
+ */
+export function classifySnifferOrigin(
+  origin: string,
+  allowedExtensionIds: string[],
+): 'extension' | 'token' | 'reject' {
+  const value = origin.trim();
+  if (!value || value === 'null' || value === 'file://') return 'token';
+  const match = /^chrome-extension:\/\/([a-z0-9]+)\/?$/i.exec(value);
+  if (match) {
+    const id = match[1].toLowerCase();
+    if (allowedExtensionIds.length === 0) return 'extension';
+    return allowedExtensionIds.map((x) => x.toLowerCase()).includes(id) ? 'extension' : 'reject';
+  }
+  // A web origin is always refused, even when it presents the shared token.
+  // A page that could write media entries would be able to plant an arbitrary
+  // download target, and browsers always send Origin for cross-origin POSTs,
+  // so no legitimate page needs this. The token path exists for callers that
+  // send no Origin at all (native tools, the app itself).
+  return 'reject';
+}
+
+function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }).end(JSON.stringify(body));
 }
 
 /**
  * Start the local capture service.
  *
  * Accepted requests (all JSON, all bound to loopback):
- *   POST /report  { url, mimeType?, sizeBytes? }
- *   GET  /health
+ *   POST /report  { url, mimeType?, sizeBytes? }   (header X-Fenxi-Token)
+ *   GET  /health                                    (header X-Fenxi-Token)
  *
- * The service refuses cross-origin writes by requiring a matching Origin or
- * no Origin at all, and rejects payloads above 64 KiB.
+ * Security properties:
+ *  - Only a `chrome-extension://` origin or a caller presenting the shared
+ *    token may talk to the service; every other origin gets 403 and the
+ *    response never reflects the request's Origin back.
+ *  - Reported URLs must be ordinary public http(s) targets, so an injected
+ *    entry cannot point the downloader at cloud metadata or a local service.
+ *  - Payloads above 64 KiB are rejected.
  */
 export async function startSniffer(opts: SnifferOptions): Promise<SnifferHandle> {
   const host = opts.host ?? '127.0.0.1';
   const seen = new Map<string, SniffedMedia>();
+  const allowedExtensionIds = opts.allowedExtensionIds ?? [];
+  const token = opts.token && opts.token.length >= 16 ? opts.token : crypto.randomBytes(32).toString('hex');
+
+  const reject = (res: http.ServerResponse, status: number, reason: SnifferRejection): void => {
+    // Never echo the request Origin back: that is the original CORS bug.
+    sendJson(res, status, { accepted: false, error: reason });
+  };
 
   const server = http.createServer((req, res) => {
-    const origin = req.headers.origin;
-    // Loopback-only, and only for our own extension origins.
-    res.setHeader('Access-Control-Allow-Origin', origin ?? 'null');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    // A single, fixed policy: extensions are trusted by origin, nothing else.
+    const origin = originOf(req);
+    const originClass = classifySnifferOrigin(origin, allowedExtensionIds);
+    if (originClass === 'extension') {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+    }
     res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Fenxi-Token');
+    res.setHeader('Access-Control-Max-Age', '600');
 
     if (req.method === 'OPTIONS') {
+      if (originClass === 'reject') {
+        reject(res, 403, 'origin-not-allowed');
+        return;
+      }
       res.writeHead(204).end();
       return;
     }
-    if (req.method === 'GET' && req.url === '/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' }).end(
-        JSON.stringify({ ok: true, intercepted: seen.size }),
-      );
+    if (originClass === 'reject') {
+      opts.onLog?.(`Refused a media report from origin ${origin || '(none)'}.`);
+      reject(res, 403, 'origin-not-allowed');
+      return;
+    }
+
+    const presented = req.headers['x-fenxi-token'];
+    const presentedToken = Array.isArray(presented) ? presented[0] ?? '' : presented ?? '';
+    let tokenOk = false;
+    if (presentedToken.length === token.length) {
+      try {
+        tokenOk = crypto.timingSafeEqual(Buffer.from(presentedToken), Buffer.from(token));
+      } catch {
+        tokenOk = false;
+      }
+    }
+    if (originClass === 'token' && !tokenOk) {
+      reject(res, 401, presentedToken ? 'token-invalid' : 'token-required');
+      return;
+    }
+
+    if (req.method === 'GET' && (req.url === '/health' || req.url === '/health/')) {
+      sendJson(res, 200, { ok: true, intercepted: seen.size });
       return;
     }
     if (req.method !== 'POST' || req.url !== '/report') {
-      res.writeHead(404, { 'Content-Type': 'text/plain' }).end('not found');
+      reject(res, 404, 'not-found');
       return;
     }
 
     const chunks: Buffer[] = [];
     let size = 0;
+    let aborted = false;
     req.on('data', (c: Buffer) => {
+      if (aborted) return;
       size += c.length;
       if (size > 64 * 1024) {
+        aborted = true;
+        reject(res, 413, 'body-too-large');
         req.destroy();
         return;
       }
       chunks.push(c);
     });
     req.on('end', () => {
+      if (aborted) return;
       let body: unknown;
       try {
         body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
       } catch {
-        res.writeHead(400, { 'Content-Type': 'text/plain' }).end('invalid json');
+        reject(res, 400, 'invalid-json');
         return;
       }
-      const rec = body as Record<string, unknown>;
-      const url = typeof rec.url === 'string' ? rec.url : '';
-      if (!/^https?:\/\//i.test(url)) {
-        res.writeHead(400, { 'Content-Type': 'text/plain' }).end('invalid url');
+      if (!isRecord(body)) {
+        reject(res, 400, 'invalid-json');
         return;
       }
-      const mime = typeof rec.mimeType === 'string' ? rec.mimeType : null;
+      const url = typeof body.url === 'string' ? body.url.trim() : '';
+      if (!/^https?:\/\//i.test(url) || url.length > 4096) {
+        reject(res, 400, 'invalid-url');
+        return;
+      }
+      try {
+        // An entry becomes a download target, so it must not address the
+        // machine itself or a link-local/metadata endpoint.
+        assertOutboundHostAllowed(url, { blockLoopback: true });
+      } catch {
+        opts.onLog?.(`Refused a media report for a non-public address.`);
+        reject(res, 400, 'blocked-host');
+        return;
+      }
+      const mime = typeof body.mimeType === 'string' ? body.mimeType.slice(0, 200) : null;
       const kind = classifyMedia(url, mime);
       if (!kind) {
-        res.writeHead(202, { 'Content-Type': 'application/json' }).end(JSON.stringify({ accepted: false }));
+        sendJson(res, 202, { accepted: false });
         return;
       }
       if (seen.has(url)) {
-        res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ accepted: true, duplicate: true }));
+        sendJson(res, 200, { accepted: true, duplicate: true });
         return;
       }
       const entry: SniffedMedia = {
         url,
         kind,
         mimeType: mime ?? '',
-        sizeBytes: typeof rec.sizeBytes === 'number' ? rec.sizeBytes : null,
+        sizeBytes: typeof body.sizeBytes === 'number' && Number.isFinite(body.sizeBytes) ? body.sizeBytes : null,
         manifestUrl: null,
         variants: [],
         durationSeconds: null,
@@ -244,18 +367,19 @@ export async function startSniffer(opts: SnifferOptions): Promise<SnifferHandle>
       }
       opts.onMedia(entry);
       opts.onLog?.(`Sniffed ${kind}: ${url}`);
-      res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ accepted: true }));
+      sendJson(res, 200, { accepted: true });
     });
   });
 
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
+  await new Promise<void>((resolve, reject2) => {
+    server.once('error', reject2);
     server.listen(opts.port, host, () => resolve());
   });
 
   const actual = (server.address() as { port: number }).port;
   return {
     port: actual,
+    token,
     close: () =>
       new Promise<void>((resolve) => {
         server.close(() => resolve());

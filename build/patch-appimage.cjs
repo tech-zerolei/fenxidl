@@ -117,11 +117,7 @@ function repack(appImagePath) {
     const squash = path.join(work, 'new.squashfs');
     const comp = squashfsCompression(original, offset);
     log(`repacking with ${comp} (matching the original image)`);
-    execFileSync(
-      'mksquashfs',
-      [root, squash, '-root-owned', '-noappend', '-comp', comp, '-quiet'],
-      { stdio: 'pipe' },
-    );
+    execFileSync('mksquashfs', [root, squash, '-root-owned', '-noappend', '-comp', comp, '-quiet'], { stdio: 'pipe' });
 
     const out = Buffer.concat([runtime, fs.readFileSync(squash)]);
     fs.writeFileSync(appImagePath, out, { mode: 0o755 });
@@ -136,7 +132,10 @@ function main() {
   if (!target) {
     const dir = path.join(__dirname, '..', 'release');
     const found = fs.existsSync(dir)
-      ? fs.readdirSync(dir).filter((f) => f.endsWith('.AppImage')).sort()
+      ? fs
+          .readdirSync(dir)
+          .filter((f) => f.endsWith('.AppImage'))
+          .sort()
       : [];
     if (found.length === 0) {
       log('no AppImage found; nothing to do');

@@ -343,13 +343,26 @@ export function App(): React.ReactElement {
   const canStart = selectedTasks.some((t) => ['stopped', 'paused', 'error', 'queued'].includes(t.status));
   const canPause = selectedTasks.some((t) => t.status === 'downloading' || t.status === 'connecting');
 
+  const toggleSort = (key: SortKey): void => {
+    if (sortKey === key) setSortDesc(!sortDesc);
+    else {
+      setSortKey(key);
+      setSortDesc(key === 'added');
+    }
+  };
+
+  // Sortable headers are real controls: they take focus, expose aria-sort, and
+  // respond to Enter/Space. A bare onClick <th> made sorting mouse-only.
   const sortHeader = (key: SortKey, label: string): React.ReactElement => (
     <th
-      onClick={() => {
-        if (sortKey === key) setSortDesc(!sortDesc);
-        else {
-          setSortKey(key);
-          setSortDesc(key === 'added');
+      scope="col"
+      role="columnheader"
+      tabIndex={0}
+      onClick={() => toggleSort(key)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          toggleSort(key);
         }
       }}
       title={`排序：${SORT_LABELS[key]}`}
@@ -439,14 +452,16 @@ export function App(): React.ReactElement {
 
       <div className="md-app-body">
         <NavigationRail
-          items={
-            category === 'all' || category === 'active' || category === 'finished'
-              ? [
-                  ...primaryRail,
-                  ...typeRail,
-                ]
-              : [...primaryRail, ...typeRail]
-          }
+          items={primaryRail}
+          groups={[
+            {
+              key: 'types',
+              label: '分类',
+              icon: 'category',
+              headline: '按文件类型筛选',
+              items: typeRail,
+            },
+          ]}
           value={category}
           onChange={(id) => setCategory(id as typeof category)}
           header={
@@ -460,22 +475,11 @@ export function App(): React.ReactElement {
         <main style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
           {/* Queue actions live in a persistent surface strip so they stay
               reachable regardless of selection state. */}
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 8,
-              padding: '8px 16px',
-              background: 'var(--md-surface-container-low)',
-              borderBottom: '1px solid var(--md-outline-variant)',
-              flex: '0 0 auto',
-              flexWrap: 'wrap',
-            }}
-          >
+          <div className="md-toolbar">
             <Button variant="filled" icon="add" onClick={() => setModal({ kind: 'new' })}>
               新建下载
             </Button>
-            <div style={{ width: 1, height: 24, background: 'var(--md-outline-variant)' }} />
+            <div className="md-toolbar-separator" aria-hidden />
             <Button variant="text" icon="play" onClick={() => void act.startQueue(null)} title="开始主要下载队列">
               开始队列
             </Button>
@@ -485,7 +489,7 @@ export function App(): React.ReactElement {
             <Button variant="text" icon="stop" onClick={() => void act.stopAll()} title="停止全部的下载任务">
               全部停止
             </Button>
-            <div style={{ width: 1, height: 24, background: 'var(--md-outline-variant)' }} />
+            <div className="md-toolbar-separator" aria-hidden />
             <Button variant="text" icon="clear_all" onClick={() => void act.removeCompleted()} title="从列表中删除全部已完成的任务">
               清理已完成
             </Button>
@@ -508,36 +512,57 @@ export function App(): React.ReactElement {
                 <p className="md-empty__body">
                   {tasks.length === 0
                     ? '点击「新建下载」添加地址，或把浏览器中的下载链接复制到剪贴板（已开启监视）。'
-                    : '切换到其他分类，或清除搜索条件再试。'}
+                    : filter
+                      ? `没有匹配「${filter}」的文件。清除筛选条件即可看到当前分类的全部文件。`
+                      : '此分类中还没有文件，切换到「所有下载」可以看到全部任务。'}
                 </p>
-                {tasks.length === 0 && (
+                {/* Every empty state offers a way out. Previously only the
+                    "no tasks at all" branch had a button, so a filtered-empty
+                    list told the user to clear the search but gave them
+                    nothing to click. */}
+                {tasks.length === 0 ? (
                   <Button variant="filled" icon="add" onClick={() => setModal({ kind: 'new' })}>
                     新建下载
+                  </Button>
+                ) : filter ? (
+                  <Button variant="tonal" icon="refresh" onClick={() => setFilter('')}>
+                    清除筛选条件
+                  </Button>
+                ) : (
+                  <Button variant="tonal" icon="clear_all" onClick={() => setCategory('all')}>
+                    查看所有下载
                   </Button>
                 )}
               </div>
             ) : (
               <table className="md-table">
+                {/* Fixed columns used to total 828px against 810px of table at
+                    the 900x520 minimum window, which collapsed 文件名 to 0px.
+                    Column widths are now ceilings and the @media rules fold the
+                    secondary columns away in priority order, so the file name
+                    always keeps a floor. */}
                 <colgroup>
                   <col style={{ width: 56 }} />
-                  <col />
-                  <col style={{ width: 160 }} />
+                  <col style={{ minWidth: 200 }} />
+                  <col style={{ width: 'min(160px, 14vw)' }} />
                   <col style={{ width: 120 }} />
                   <col style={{ width: 96 }} />
                   <col style={{ width: 104 }} />
                   <col style={{ width: 112 }} />
-                  <col style={{ width: 180 }} />
+                  <col style={{ width: 'min(180px, 16vw)' }} />
                 </colgroup>
                 <thead>
                   <tr>
-                    <th className="static" title="队列">Q</th>
+                    <th className="static" scope="col" role="columnheader" title="所属队列">
+                      队列
+                    </th>
                     {sortHeader('name', '文件名')}
                     {sortHeader('description', '描述')}
                     {sortHeader('status', '状态')}
                     {sortHeader('size', '大小')}
                     {sortHeader('eta', '剩余时间')}
                     {sortHeader('speed', '传输速率')}
-                    <th className="static">进度</th>
+                    <th className="static" scope="col" role="columnheader">进度</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -552,8 +577,22 @@ export function App(): React.ReactElement {
                       <tr
                         key={task.id}
                         className={selected.has(task.id) ? 'selected' : undefined}
+                        // Rows are the primary selection control, so they must be
+                        // reachable and operable without a mouse; otherwise every
+                        // selection-only action is unavailable to keyboard users.
+                        tabIndex={0}
+                        aria-selected={selected.has(task.id)}
                         onClick={(e) => onRowClick(task, e)}
                         onDoubleClick={() => onRowDoubleClick(task)}
+                        onKeyDown={(e) => {
+                          if (e.key === ' ' || e.key === 'Enter') {
+                            e.preventDefault();
+                            setSelected(new Set([task.id]));
+                            lastRowClick.current = { id: task.id, at: Date.now() };
+                            // Enter also opens the row, mirroring double-click.
+                            if (e.key === 'Enter') onRowDoubleClick(task);
+                          }
+                        }}
                         onContextMenu={(e) => {
                           e.preventDefault();
                           if (!selected.has(task.id)) setSelected(new Set([task.id]));
@@ -569,7 +608,10 @@ export function App(): React.ReactElement {
                           <div className="md-file-cell">
                             <span
                               className="md-file-cell__glyph"
-                              style={{ background: fileColor(task.fileName) }}
+                              style={{
+                                background: fileColor(task.fileName).bg,
+                                color: fileColor(task.fileName).fg,
+                              }}
                               aria-hidden
                             >
                               {fileGlyph(task.fileName)}
@@ -596,7 +638,7 @@ export function App(): React.ReactElement {
                         </td>
                         <td>
                           <LinearProgress value={pct} variant={progressVariant} />
-                          <div className="md-supporting" style={{ fontSize: 11, marginTop: 4 }}>
+                          <div className="md-progress-meta">
                             {task.totalBytes > 0
                               ? `${pct.toFixed(1)}% · ${formatBytes(task.downloadedBytes)}`
                               : formatBytes(task.downloadedBytes)}

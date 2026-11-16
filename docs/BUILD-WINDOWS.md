@@ -1,7 +1,9 @@
 # 在 Windows 上构建安装程序
 
-本项目已验证：类型检查、24 项单元测试、分段下载端到端测试、真实 TaskManager 集成测试
-（6.3 MB / 6 段 / SHA-256 校验一致）、以及 Electron GUI 冒烟测试（真实窗口渲染 + 截图）。
+本项目已验证：类型检查（零错误）、27 项单元测试、分段下载端到端测试（哈希校验 / 续传 /
+404 各一项）、真实 TaskManager 集成测试（6.3 MB / 6 段 / SHA-256 校验一致 / 持久化往返）。
+以上全部由 `npm run verify` 一条命令覆盖。另有需要图形界面的 GUI 冒烟测试，启用方式见
+README 的「手工 GUI 冒烟测试」一节。
 
 Linux 上已成功生成 `release/win-unpacked/`（可直接运行的 Windows 程序目录），
 但生成 **NSIS 安装包** 需要在 Windows 上执行，因为 electron-builder 修改 Windows
@@ -36,9 +38,8 @@ cd D:\fenxi-dl
 REM 1. 安装依赖
 npm install
 
-REM 2. 类型检查 + 测试（应当全部通过）
-npm run build
-npm test
+REM 2. 类型检查 + 构建 + 全部测试（应当全部通过）
+npm run verify
 
 REM 3. 生成安装程序
 npm run dist:win

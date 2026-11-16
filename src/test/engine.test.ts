@@ -74,11 +74,7 @@ test('fileNameFromUrl decodes percent escapes and query strings', () => {
 
 test('expandBatch pads with the requested width', () => {
   const out = expandBatch({ template: 'https://h/i*.jpg', from: 1, to: 3, width: 3 });
-  assert.deepEqual(out.urls, [
-    'https://h/i001.jpg',
-    'https://h/i002.jpg',
-    'https://h/i003.jpg',
-  ]);
+  assert.deepEqual(out.urls, ['https://h/i001.jpg', 'https://h/i002.jpg', 'https://h/i003.jpg']);
   assert.deepEqual(out.issues, []);
 });
 

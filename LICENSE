@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 FenxiDL Project
+Copyright (c) 2026 tech-zerolei
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +19,17 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+FenxiDL is an independent implementation based on publicly documented
+behaviour. Its feature set was informed by a static analysis of Internet
+Download Manager 6.43 build 18, but this project contains no binary code,
+icons, language files or other copyrighted resources from that product, and it
+does not implement that product's licensing or registration mechanism.
+
+FenxiDL is not affiliated with, endorsed by, or otherwise connected to
+Tonec Inc. or the publishers of Internet Download Manager.
+
+Third-party components and their licences are listed in
+assets/THIRD-PARTY-NOTICES.txt.

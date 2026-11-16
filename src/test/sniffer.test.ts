@@ -43,7 +43,10 @@ test('parseHlsManifest sums segment durations', () => {
   const manifest = ['#EXTM3U', '#EXTINF:4.5,', 'a.ts', '#EXTINF:5.5,', 'b.ts'].join('\n');
   const out = parseHlsManifest(manifest, 'https://a/x.m3u8');
   assert.deepEqual(out.durations, [4.5, 5.5]);
-  assert.equal(out.durations.reduce((x, y) => x + y, 0), 10);
+  assert.equal(
+    out.durations.reduce((x, y) => x + y, 0),
+    10,
+  );
 });
 
 test('parseDashManifest reads representations and duration', () => {

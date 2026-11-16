@@ -9,6 +9,23 @@
 import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { Icon, type IconName } from './icons';
 
+/** Selector for everything that can receive keyboard focus inside a subtree. */
+const FOCUSABLE_SELECTOR = [
+  'a[href]',
+  'button:not([disabled])',
+  'input:not([disabled]):not([type="hidden"])',
+  'select:not([disabled])',
+  'textarea:not([disabled])',
+  '[tabindex]:not([tabindex="-1"])',
+].join(',');
+
+/** Focusable descendants that are actually rendered (not display:none). */
+function focusableWithin(root: HTMLElement): HTMLElement[] {
+  return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+    (el) => el.offsetParent !== null || el === document.activeElement,
+  );
+}
+
 /* ========================================================================== */
 /* Buttons                                                                     */
 /* ========================================================================== */
@@ -287,10 +304,13 @@ export function SearchBar({
   value,
   onChange,
   placeholder,
+  label = '搜索',
 }: {
   value: string;
   onChange: (value: string) => void;
   placeholder?: string;
+  /** Accessible name; falls back to a Chinese default, never English. */
+  label?: string;
 }): React.ReactElement {
   return (
     <div className="md-search">
@@ -300,7 +320,7 @@ export function SearchBar({
         value={value}
         placeholder={placeholder}
         onChange={(e) => onChange(e.target.value)}
-        aria-label={placeholder ?? 'Search'}
+        aria-label={label}
       />
     </div>
   );
@@ -399,8 +419,8 @@ export function LinearProgress({
   );
 }
 
-export function CircularProgress(): React.ReactElement {
-  return <span className="md-circular-progress" role="progressbar" aria-label="Loading" />;
+export function CircularProgress({ label = '正在加载' }: { label?: string } = {}): React.ReactElement {
+  return <span className="md-circular-progress" role="progressbar" aria-label={label} />;
 }
 
 export function StatusBadge({
@@ -435,23 +455,107 @@ export function Dialog({
   dismissOnScrimClick?: boolean;
 }): React.ReactElement {
   const dialogRef = useRef<HTMLDivElement>(null);
+  const headlineRef = useRef<HTMLDivElement>(null);
+  const restoreRef = useRef<HTMLElement | null>(null);
+  const headlineId = useId();
+  // Most call sites recreate `onClose` on every render; the key listener reads
+  // it through a ref so the handler (and the trap it implements) is installed
+  // exactly once for the dialog's lifetime.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
+  /* Remember the element that had focus before the dialog opened and give it
+     back on unmount. Without this, closing dropped focus on <body> and the
+     keyboard user restarted the tab order from the top of the window. */
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+    const active = document.activeElement;
+    restoreRef.current = active instanceof HTMLElement ? active : null;
+    return () => {
+      const target = restoreRef.current;
+      restoreRef.current = null;
+      // A trigger that has since been removed must not throw, and focus must
+      // never be handed to a detached node.
+      if (target && document.body.contains(target)) {
+        target.focus({ preventScroll: true });
+      }
     };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
+  }, []);
 
-  // Move focus into the dialog so keyboard users land inside it.
+  /* Escape closes, and Tab/Shift+Tab cycle inside the dialog.
+
+     `aria-modal="true"` promises assistive technology that the rest of the
+     document is inert, so focus has to actually stay inside; the previous
+     build let one Tab reach the search box behind the scrim. Capture phase is
+     used so nothing deeper can pre-empt the wrap-around. */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        onCloseRef.current();
+        return;
+      }
+      if (e.key !== 'Tab') return;
+      const node = dialogRef.current;
+      if (!node) return;
+
+      const items = focusableWithin(node);
+      if (items.length === 0) {
+        // Nothing focusable: hold focus on the dialog container itself.
+        e.preventDefault();
+        node.focus({ preventScroll: true });
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement as HTMLElement | null;
+
+      // Focus outside the dialog (or nowhere): pull it back to an edge.
+      if (!active || !node.contains(active)) {
+        e.preventDefault();
+        (e.shiftKey ? last : first).focus();
+        return;
+      }
+      if (e.shiftKey && active === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, []);
+
+  /* Initial focus.
+
+     Prefer the first real control inside the content area (a dialog that asks
+     for input should start typing immediately). Dialogues without a control —
+     About, confirmations — focus the headline instead of the close button, so
+     a screen reader announces the dialog's name. */
   useEffect(() => {
     const node = dialogRef.current;
     if (!node) return;
-    const target = node.querySelector<HTMLElement>(
-      'input:not([type="hidden"]), select, textarea, button',
+    const preferred = node.querySelector<HTMLElement>(
+      '.md-dialog__content input:not([type="hidden"]):not([disabled]),'
+      + ' .md-dialog__content select:not([disabled]),'
+      + ' .md-dialog__content textarea:not([disabled]),'
+      + ' .md-dialog__content button:not([disabled]),'
+      + ' .md-dialog__actions button:not([disabled])',
     );
-    target?.focus();
+    if (preferred) {
+      preferred.focus({ preventScroll: true });
+      return;
+    }
+    const heading = headlineRef.current;
+    if (heading) {
+      heading.tabIndex = -1;
+      heading.focus({ preventScroll: true });
+      return;
+    }
+    node.focus({ preventScroll: true });
   }, []);
 
   return (
@@ -466,10 +570,14 @@ export function Dialog({
         className={`md-dialog${size === 'wide' ? ' md-dialog--wide' : size === 'narrow' ? ' md-dialog--narrow' : ''}`}
         role="dialog"
         aria-modal="true"
+        aria-labelledby={headlineId}
+        tabIndex={-1}
       >
         <div className="md-dialog__header">
           <div style={{ flex: 1, minWidth: 0 }}>
-            <div className="md-dialog__headline">{headline}</div>
+            <div className="md-dialog__headline" id={headlineId} ref={headlineRef}>
+              {headline}
+            </div>
             {subhead && <div className="md-dialog__subhead">{subhead}</div>}
           </div>
           <IconButton icon="close" onClick={onClose} label="关闭" />
@@ -562,55 +670,216 @@ export interface RailItem<T extends string> {
   count?: number;
 }
 
+export interface RailGroup<T extends string> {
+  key: string;
+  label: string;
+  icon?: IconName;
+  headline?: string;
+  items: RailItem<T>[];
+}
+
+/**
+ * MD3 navigation rail.
+ *
+ * MD3 caps a rail at 3–7 destinations, and this window can be as short as
+ * 520px, so the seven file-type filters are folded into one `group` entry that
+ * opens a flyout panel beside the rail. The rail therefore keeps a constant
+ * height (3 primary views + 1 group entry + the About footer), and every entry
+ * stays reachable at any window size without relying on an invisible scroll.
+ *
+ * The panel is `position: fixed` and placed from the trigger's measured rect,
+ * so it can never be clipped by the rail's own `overflow: auto`.
+ */
 export function NavigationRail<T extends string>({
   items,
   value,
   onChange,
   header,
   footer,
+  groups,
 }: {
   items: RailItem<T>[];
   value: T;
   onChange: (id: T) => void;
   header?: React.ReactNode;
   footer?: React.ReactNode;
+  /** Secondary destinations folded behind one expanding entry. */
+  groups?: Array<RailGroup<T>>;
 }): React.ReactElement {
-  return (
-    <nav className="md-nav-rail" aria-label="主要导航">
-      {header}
-      {items.map((item) => (
-        <button
-          key={item.id}
-          type="button"
-          className="md-nav-rail__item"
-          aria-current={value === item.id ? 'page' : undefined}
-          onClick={() => onChange(item.id)}
-          title={item.label}
-        >
-          <span className="md-nav-rail__indicator">
-            <span className="md-nav-rail__icon" aria-hidden>
-              {isIconName(item.icon) ? (
-                <Icon name={item.icon} size={22} />
-              ) : (
-                item.icon
-              )}
-            </span>
-            {!!item.count && item.count > 0 && (
-              <span className="md-nav-rail__count" aria-label={`${item.count} items`}>
-                {item.count > 99 ? '99+' : item.count}
-              </span>
-            )}
+  const railRef = useRef<HTMLElement>(null);
+  const groupTriggers = useRef(new Map<string, HTMLButtonElement>());
+  const panelRef = useRef<HTMLDivElement>(null);
+  const [openGroup, setOpenGroup] = useState<string | null>(null);
+  const [placement, setPlacement] = useState<{ left: number; top: number; maxHeight: number } | null>(null);
+
+  // Re-anchor (or dismiss) the flyout when the window resizes: a stale fixed
+  // position would point at nothing after the rail moves.
+  useEffect(() => {
+    if (openGroup === null) return;
+    const place = (): void => {
+      const trigger = groupTriggers.current.get(openGroup);
+      if (!trigger) return;
+      const r = trigger.getBoundingClientRect();
+      const top = Math.max(8, Math.min(r.top, window.innerHeight - 160));
+      setPlacement({
+        left: r.right + 8,
+        top,
+        maxHeight: Math.max(160, window.innerHeight - top - 12),
+      });
+    };
+    place();
+    window.addEventListener('resize', place);
+    return () => window.removeEventListener('resize', place);
+  }, [openGroup]);
+
+  // Esc closes the flyout and hands focus back to its trigger; a pointerdown
+  // anywhere outside the panel does the same.
+  useEffect(() => {
+    if (openGroup === null) return;
+    const trigger = groupTriggers.current.get(openGroup);
+    const onKeyDown = (e: KeyboardEvent): void => {
+      if (e.key !== 'Escape') return;
+      e.stopPropagation();
+      e.preventDefault();
+      setOpenGroup(null);
+      trigger?.focus();
+    };
+    const onPointerDown = (e: PointerEvent): void => {
+      const panel = panelRef.current;
+      if (panel && panel.contains(e.target as Node)) return;
+      if (trigger && trigger.contains(e.target as Node)) return;
+      setOpenGroup(null);
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    window.addEventListener('pointerdown', onPointerDown, true);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown, true);
+      window.removeEventListener('pointerdown', onPointerDown, true);
+    };
+  }, [openGroup]);
+
+  // Move focus into the panel when it opens so keyboard users land on the
+  // first choice rather than being left on the trigger.
+  useEffect(() => {
+    if (openGroup === null || !placement) return;
+    const first = panelRef.current?.querySelector<HTMLElement>('.md-rail-category-panel__item');
+    first?.focus({ preventScroll: true });
+  }, [openGroup, placement]);
+
+  const renderItem = (item: RailItem<T>): React.ReactElement => (
+    <button
+      key={item.id}
+      type="button"
+      className="md-nav-rail__item"
+      aria-current={value === item.id ? 'page' : undefined}
+      onClick={() => onChange(item.id)}
+      title={item.label}
+    >
+      <span className="md-nav-rail__indicator">
+        <span className="md-nav-rail__icon" aria-hidden>
+          {isIconName(item.icon) ? <Icon name={item.icon} size={22} /> : item.icon}
+        </span>
+        {!!item.count && item.count > 0 && (
+          <span className="md-nav-rail__count" aria-label={`${item.count} 个项目`}>
+            {item.count > 99 ? '99+' : item.count}
           </span>
-          <span className="md-nav-rail__label">{item.label}</span>
-        </button>
-      ))}
-      {footer && (
-        <>
-          <hr className="md-nav-rail__divider" />
-          {footer}
-        </>
+        )}
+      </span>
+      <span className="md-nav-rail__label">{item.label}</span>
+    </button>
+  );
+
+  const openGroupDef = (groups ?? []).find((g) => g.key === openGroup) ?? null;
+
+  return (
+    <div className="md-nav-rail-wrap">
+      <nav className="md-nav-rail" aria-label="主要导航" ref={railRef}>
+        {header}
+        <div className="md-nav-rail__scroll">
+          {items.map(renderItem)}
+          {(groups ?? []).map((group) => {
+            const expanded = openGroup === group.key;
+            const active = group.items.some((i) => i.id === value);
+            const total = group.items.reduce((sum, i) => sum + (i.count ?? 0), 0);
+            return (
+              <button
+                key={group.key}
+                type="button"
+                ref={(el) => {
+                  if (el) groupTriggers.current.set(group.key, el);
+                  else groupTriggers.current.delete(group.key);
+                }}
+                className="md-nav-rail__item md-nav-rail__item--group"
+                data-rail-category={group.key}
+                data-active-group={active ? 'true' : undefined}
+                aria-expanded={expanded}
+                aria-haspopup="true"
+                aria-controls={expanded ? `rail-group-${group.key}` : undefined}
+                onClick={() => setOpenGroup((prev) => (prev === group.key ? null : group.key))}
+                title={expanded ? `收起${group.label}` : `展开${group.label}`}
+              >
+                <span className="md-nav-rail__indicator">
+                  <span className="md-nav-rail__icon" aria-hidden>
+                    <Icon name={group.icon ?? 'category'} size={22} />
+                  </span>
+                  {!expanded && active && (
+                    <span className="md-nav-rail__badge-dot" aria-hidden />
+                  )}
+                  {!expanded && total > 0 && (
+                    <span className="md-nav-rail__count" aria-label={`${total} 个项目`}>
+                      {total > 99 ? '99+' : total}
+                    </span>
+                  )}
+                </span>
+                <span className="md-nav-rail__label">{group.label}</span>
+              </button>
+            );
+          })}
+        </div>
+        {footer && (
+          <div className="md-nav-rail__footer">
+            <hr className="md-nav-rail__divider" />
+            {footer}
+          </div>
+        )}
+      </nav>
+
+      {openGroupDef && placement && (
+        <div
+          ref={panelRef}
+          id={`rail-group-${openGroupDef.key}`}
+          className="md-rail-category-panel"
+          style={{ left: placement.left, top: placement.top, maxHeight: placement.maxHeight }}
+          role="group"
+          aria-label={openGroupDef.label}
+        >
+          <div className="md-rail-category-panel__headline" aria-hidden>
+            {openGroupDef.headline ?? openGroupDef.label}
+          </div>
+          {openGroupDef.items.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              className="md-rail-category-panel__item"
+              aria-current={value === item.id ? 'true' : undefined}
+              onClick={() => {
+                onChange(item.id);
+                setOpenGroup(null);
+                groupTriggers.current.get(openGroupDef.key)?.focus();
+              }}
+            >
+              <span className="md-rail-category-panel__icon" aria-hidden>
+                {isIconName(item.icon) ? <Icon name={item.icon} size={20} /> : item.icon}
+              </span>
+              <span className="md-rail-category-panel__label">{item.label}</span>
+              {!!item.count && item.count > 0 && (
+                <span className="md-rail-category-panel__count">{item.count}</span>
+              )}
+            </button>
+          ))}
+        </div>
       )}
-    </nav>
+    </div>
   );
 }
 

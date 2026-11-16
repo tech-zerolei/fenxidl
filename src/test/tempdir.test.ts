@@ -1,25 +1,28 @@
 /**
  * Verify the temp-directory staging path: partial data lives in the temp
  * folder during transfer and is promoted to the final path on completion.
+ *
+ * Both directories come from `mkdtempSync` so the test never touches the shared
+ * `os.tmpdir()/FenxiDL` staging directory (which may be owned by root on a
+ * multi-user machine). Cleanup runs in `finally`, including the failure path.
  */
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import * as http from 'node:http';
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { TaskManager } from '../main/task-manager';
 import { defaultSettings } from '../main/settings';
-import type { Queue } from '../shared/types';
+import type { AppSettings, Queue } from '../shared/types';
+import { createWorkspace } from './harness';
 
-test('downloads stage in the temp directory and land at the final path', async () => {
-  const size = 1 * 1024 * 1024 + 321;
-  const body = crypto.randomBytes(size);
-  const expected = crypto.createHash('sha256').update(body).digest('hex');
+/** Upper bound for the transfer; previously 40s. */
+const DOWNLOAD_TIMEOUT_MS = 60_000;
 
-  const server = http.createServer((req, res) => {
+function makeServer(body: Buffer): http.Server {
+  return http.createServer((req, res) => {
     const range = req.headers.range;
     if (typeof range === 'string') {
       const m = /bytes=(\d+)-(\d*)/.exec(range);
@@ -39,51 +42,71 @@ test('downloads stage in the temp directory and land at the final path', async (
     res.writeHead(200, { 'Content-Length': String(body.length), 'Content-Type': 'application/octet-stream' });
     res.end(body);
   });
-  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
-  const port = (server.address() as { port: number }).port;
+}
 
-  const finalDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fenxidl-final-'));
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fenxidl-temp-'));
+test('downloads stage in the temp directory and land at the final path', async () => {
+  const size = 1 * 1024 * 1024 + 321;
+  const body = crypto.randomBytes(size);
+  const expected = crypto.createHash('sha256').update(body).digest('hex');
 
-  const settings = defaultSettings();
-  settings.defaultDirectory = finalDir;
-  settings.categories = settings.categories.map((c) => ({ ...c, directory: finalDir }));
-  settings.tempDirectory = tempDir;
-  settings.defaultConnections = 4;
+  const workspace = createWorkspace('fenxidl-temp');
+  const server = makeServer(body);
+  let manager: TaskManager | null = null;
 
-  const queues: Queue[] = [{ id: 'primary', name: 'Main', concurrency: 2, isPrimary: true }];
-  const manager = new TaskManager({
-    settings,
-    queues,
-    schedules: [],
-    storagePath: path.join(finalDir, 'state.json'),
-  });
-  await manager.load();
+  try {
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const port = (server.address() as { port: number }).port;
 
-  const done = new Promise<void>((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error('timeout')), 40_000);
-    manager.on('completed', () => {
-      clearTimeout(t);
-      resolve();
+    const settings: AppSettings = defaultSettings();
+    settings.defaultDirectory = workspace.finalDir;
+    settings.categories = settings.categories.map((c) => ({ ...c, directory: workspace.finalDir }));
+    settings.tempDirectory = workspace.tempDir;
+    settings.defaultConnections = 4;
+
+    const queues: Queue[] = [{ id: 'primary', name: 'Main', concurrency: 2, isPrimary: true }];
+    manager = new TaskManager({
+      settings,
+      queues,
+      schedules: [],
+      storagePath: workspace.storagePath,
     });
-  });
+    await manager.load();
 
-  const task = manager.createTask({ url: `http://127.0.0.1:${port}/staged.bin` });
-  manager.start(task.id);
-  await done;
+    const created = manager.createTask({ url: `http://127.0.0.1:${port}/staged.bin` });
+    const done = new Promise<void>((resolve, reject) => {
+      const t = setTimeout(() => {
+        const current = manager?.getTask(created.id);
+        reject(
+          new Error(
+            `download did not finish in ${DOWNLOAD_TIMEOUT_MS}ms — ` +
+              `status=${current?.status ?? 'missing'} ` +
+              `downloaded=${current?.downloadedBytes ?? 0}/${current?.totalBytes ?? 0} ` +
+              `error=${current?.error?.message ?? 'none'}`,
+          ),
+        );
+      }, DOWNLOAD_TIMEOUT_MS);
+      manager!.on('completed', () => {
+        clearTimeout(t);
+        resolve();
+      });
+    });
 
-  const finalTask = manager.getTask(task.id);
-  assert.equal(finalTask?.status, 'completed');
-  assert.ok(fs.existsSync(finalTask!.savePath), 'final file must exist');
-  const hash = crypto.createHash('sha256').update(fs.readFileSync(finalTask!.savePath)).digest('hex');
-  assert.equal(hash, expected, 'promoted file must be byte-identical');
+    manager.start(created.id);
+    await done;
 
-  // The temp directory must be empty of our staged file after promotion.
-  const leftovers = fs.readdirSync(tempDir).filter((f) => f.endsWith('.part'));
-  assert.equal(leftovers.length, 0, `staged file was not cleaned up: ${leftovers.join(',')}`);
+    const finalTask = manager.getTask(created.id);
+    assert.equal(finalTask?.status, 'completed');
+    assert.ok(fs.existsSync(finalTask!.savePath), 'final file must exist');
+    const hash = crypto.createHash('sha256').update(fs.readFileSync(finalTask!.savePath)).digest('hex');
+    assert.equal(hash, expected, 'promoted file must be byte-identical');
 
-  await manager.dispose();
-  server.close();
-  fs.rmSync(finalDir, { recursive: true, force: true });
-  fs.rmSync(tempDir, { recursive: true, force: true });
+    // The temp directory must be empty of our staged file after promotion.
+    const leftovers = fs.readdirSync(workspace.tempDir).filter((f) => f.endsWith('.part'));
+    assert.equal(leftovers.length, 0, `staged file was not cleaned up: ${leftovers.join(',')}`);
+    assert.ok(fs.existsSync(path.join(workspace.finalDir)), 'final directory must survive');
+  } finally {
+    if (manager) await manager.dispose();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    workspace.remove();
+  }
 });

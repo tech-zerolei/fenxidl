@@ -6,14 +6,7 @@
  * completed, with paused / stopped / error branches.
  */
 
-export type TaskStatus =
-  | 'queued'
-  | 'connecting'
-  | 'downloading'
-  | 'paused'
-  | 'stopped'
-  | 'completed'
-  | 'error';
+export type TaskStatus = 'queued' | 'connecting' | 'downloading' | 'paused' | 'stopped' | 'completed' | 'error';
 
 export type CategoryId = 'completed' | 'programs' | 'music' | 'video' | 'games' | 'documents' | 'archives' | 'other';
 
@@ -63,11 +56,25 @@ export interface DownloadTask {
   username: string | null;
   password: string | null;
   referer: string | null;
+  /**
+   * @deprecated NOT IMPLEMENTED — kept for contract compatibility only.
+   * Per-task user agent is plumbed through the request pipeline
+   * (`download-engine.ts` reads `options.userAgent`), but nothing ever writes a
+   * non-null value: `task-manager.ts` hard-codes `userAgent: null` on creation
+   * and `TaskCreateInput` has no `userAgent` field, so the user has no entry
+   * point. Either add `userAgent` to `TaskCreateInput` and wire the new-task
+   * dialog, or remove this field.
+   */
   userAgent: string | null;
   /** Extra request headers parsed from the new-task dialog. */
   headers: Record<string, string>;
   error: TaskError | null;
-  /** Set when a range request proved the server ignored Range. */
+  /**
+   * Set when the engine detects that the file changed on the server between
+   * attempts (`ETag`/`Last-Modified` mismatch) and restarts the transfer from
+   * byte 0. Written by `task-manager.ts`; still not surfaced in the UI, so a
+   * user only learns about the restart from the log channel.
+   */
   restartedFromZero: boolean;
   /** Verification info captured on completion. */
   etag: string | null;
@@ -150,12 +157,33 @@ export interface AppSettings {
   browserIntegration: boolean;
   autoStartExtensions: string[];
   showMediaBar: boolean;
+  /**
+   * @deprecated NOT IMPLEMENTED — the UI is hard-coded Simplified Chinese.
+   * The value is forwarded to the renderer through the `uiFlags` payload
+   * (`index.ts`) and there is a `dl:languages` IPC channel, but no renderer
+   * code consumes either one. `LANGUAGES` in `settings.ts` advertises zh-CN /
+   * en-US / zh-TW that do not exist. Either implement i18n or drop the field
+   * and the channel.
+   */
   language: string;
+  /**
+   * @deprecated NOT IMPLEMENTED — there is no "tip of the day" feature.
+   * Forwarded to `uiFlags` and typed in `App.tsx`, but never read; `FEATURE-SPEC`
+   * §10 lists 每日提示 as required. Either implement the dialog or remove the
+   * option from `OptionsDialog`.
+   */
   showTipsOnStartup: boolean;
 
   // Connection
   defaultConnections: number;
   serverConnectionOverrides: Record<string, number>;
+  /**
+   * @deprecated NOT IMPLEMENTED — selecting a connection type has no effect.
+   * `OptionsDialog` offers 8 presets (Unlimited / 256K / … / 10M), but no code
+   * maps the id to a concurrency count or a speed cap, so the dropdown is
+   * misleading. Either map it onto `defaultConnections` + `globalSpeedLimit` on
+   * save, or remove the control.
+   */
   connectionTypeId: string;
   quota: QuotaSettings;
 
@@ -172,15 +200,33 @@ export interface AppSettings {
   // Proxy
   httpProxy: ProxySettings;
   httpsProxy: ProxySettings;
+  /**
+   * @deprecated NOT IMPLEMENTED — this project has no FTP support at all.
+   * `README` states FTP is unsupported and `grep -rn ftp src/main/` finds no
+   * protocol code, yet `OptionsDialog` still renders an FTP proxy section that
+   * writes to this field. Either remove the control or delete the field.
+   */
   ftpProxy: ProxySettings;
+  /**
+   * @deprecated NOT IMPLEMENTED — see {@link ftpProxy}.
+   * "Use passive (PASV) mode" is offered in the options dialog and persisted,
+   * but nothing reads it because there is no FTP client.
+   */
   ftpPassive: boolean;
 
   // Passwords
   credentials: SiteCredential[];
 
   // Dial-up
+  /**
+   * @deprecated NOT IMPLEMENTED — there is no dial-up code path.
+   * The UI even admits "takes effect only if a dial-up entry is configured", but
+   * no connection API is called anywhere in the project.
+   */
   useDialup: boolean;
+  /** @deprecated NOT IMPLEMENTED — see {@link useDialup}. */
   redialAttempts: number;
+  /** @deprecated NOT IMPLEMENTED — see {@link useDialup}. */
   redialIntervalSeconds: number;
 
   // Behaviour

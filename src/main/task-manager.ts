@@ -20,11 +20,11 @@ import type {
   ProgressSnapshot,
   Queue,
   ScheduleEntry,
+  Segment,
   TaskCreateInput,
   TaskStatus,
 } from '../shared/types';
 import {
-  retryPolicy,
   describeTransferError,
   downloadSegment,
   fileNameFromUrl,
@@ -33,9 +33,11 @@ import {
   prepareFile,
   probe,
   sanitizeFileName,
+  statWorkFile,
   uniquePath,
   type RequestOptions,
 } from './download-engine';
+import { buildScanArgv, hostMatchesSite } from './validate';
 
 export interface TaskManagerOptions {
   settings: AppSettings;
@@ -46,6 +48,10 @@ export interface TaskManagerOptions {
 
 interface RunningTask {
   controller: AbortController;
+  /** Unique per start(); stale cleanup handlers compare against it. */
+  token: number;
+  /** Why the run is ending, so the terminal status matches the user's action. */
+  intent: 'running' | 'pause' | 'stop';
   /** Bytes counted in the current speed sample window. */
   windowBytes: number;
   windowStart: number;
@@ -76,6 +82,26 @@ export class TaskManager extends EventEmitter {
   private quotaWindowKey = '';
   private quotaPaused = false;
   private disposed = false;
+  /** Monotonic counter backing RunningTask.token. */
+  private runTokenSeq = 0;
+  /**
+   * Tasks the user stopped explicitly, and tasks a queue-level stop parked.
+   * Both live only in memory: after a restart everything is `paused` and the
+   * user resumes it deliberately.
+   */
+  private userStopped = new Set<string>();
+  private queueStopped = new Set<string>();
+  /**
+   * While true, {@link pump} refuses to start anything.
+   *
+   * Aborting a transfer is asynchronous: `run()`'s rejection handler runs on a
+   * later tick and calls pump(), so a bulk stop that aborted several tasks
+   * could have a queued task started again *after* the stop loop finished.
+   * stopAll()/stopQueue() set this for the duration of the operation.
+   */
+  private pumpHalted = false;
+  /** Tasks paused by the quota latch, resumed when the latch clears. */
+  private quotaPausedIds = new Set<string>();
 
   constructor(opts: TaskManagerOptions) {
     super();
@@ -186,12 +212,58 @@ export class TaskManager extends EventEmitter {
 
   // ---------------------------------------------------------------- creation
 
-  /** Resolve the save directory for a category, honouring the spec defaults. */
-  private resolveDirectory(categoryId: DownloadTask['categoryId'], explicit?: string): string {
+  /**
+   * Resolve the save directory for a category, honouring the spec defaults.
+   *
+   * Order: the caller's explicit choice, then the category rule, then — for a
+   * *general* download with "use the last path" enabled — the remembered
+   * folder, then the global default.
+   *
+   * The remembered folder currently arrives in the `completed` archive rule's
+   * `directory` (that is where `index.ts` stores it, see
+   * {@link rememberedGeneralDirectory}). Reading it here is what makes the
+   * option work at all: without this branch the value was written and never
+   * consulted, because `categoryForUrl` skips the `completed` rule.
+   * The clean fix is a dedicated `lastGeneralDirectory` setting; until then
+   * this keeps the option functional and confined to general downloads.
+   */
+  private resolveDirectory(
+    categoryId: DownloadTask['categoryId'],
+    explicit?: string,
+    inferred = false,
+  ): string {
     if (explicit && explicit.trim()) return explicit;
+    // A general download — one whose folder was inferred from the URL rather
+    // than chosen by the caller — follows the remembered folder when the option
+    // is on. Category rules, which the user configured explicitly, still win
+    // for their own extensions.
+    // `other` is the general-download bucket: no extension rule matched, so the
+    // user has expressed no per-type preference and the remembered folder wins.
+    if (inferred && categoryId === 'other') {
+      const remembered = this.rememberedGeneralDirectory();
+      if (remembered) return remembered;
+    }
     const rule = this.settings.categories.find((c) => c.id === categoryId);
     if (rule && rule.directory.trim()) return rule.directory;
     return this.settings.defaultDirectory;
+  }
+
+  /**
+   * The folder the user picked for the previous general download, or ''.
+   *
+   * `index.ts` (spec string 1190) persists that choice by overwriting the
+   * `completed` category's `directory`, and `categoryForUrl` deliberately skips
+   * `completed` — so the value was stored but never read back, and the option
+   * silently did nothing. Reading it here fixes the behaviour without touching
+   * the IPC layer. See reports/engine.md item 18 for the decoupled version.
+   */
+  private rememberedGeneralDirectory(): string {
+    if (!this.settings.useLastPathForGeneral) return '';
+    const completed = this.settings.categories.find((c) => c.id === 'completed');
+    const dir = completed?.directory?.trim() ?? '';
+    if (!dir) return '';
+    // Guard against a nonsense value acting as a download root.
+    return path.isAbsolute(dir) ? dir : '';
   }
 
   private categoryForUrl(url: string, fallback: DownloadTask['categoryId']): DownloadTask['categoryId'] {
@@ -218,8 +290,12 @@ export class TaskManager extends EventEmitter {
   }
 
   createTask(input: TaskCreateInput): DownloadTask {
+    // `inferred` records whether the category came from the URL rather than
+    // from the caller; resolveDirectory uses it to apply "use the last path"
+    // only to general downloads.
+    const inferred = input.categoryId === undefined;
     const categoryId = input.categoryId ?? this.categoryForUrl(input.url, 'other');
-    const directory = this.resolveDirectory(categoryId, input.directory);
+    const directory = this.resolveDirectory(categoryId, input.directory, inferred);
     const fileName = sanitizeFileName(input.fileName?.trim() || fileNameFromUrl(input.url));
     const claimed = new Set([...this.tasks.values()].map((t) => t.savePath));
     const savePath = uniquePath(directory, fileName, claimed);
@@ -232,7 +308,11 @@ export class TaskManager extends EventEmitter {
       directory,
       categoryId,
       description: input.description?.trim() || '',
-      status: input.addToQueueOnly ? 'queued' : 'queued',
+      // A new task never starts on its own, whatever `addToQueueOnly` says:
+      // the caller decides by calling start()/pump(). The old
+      // `addToQueueOnly ? 'queued' : 'queued'` spelled the same value twice and
+      // implied a distinction that does not exist.
+      status: 'queued',
       totalBytes: 0,
       downloadedBytes: 0,
       speed: 0,
@@ -298,17 +378,19 @@ export class TaskManager extends EventEmitter {
   /** Credentials for a host: task-level override, then the site store. */
   private credentialsFor(task: DownloadTask): { username: string | null; password: string | null } {
     if (task.username) return { username: task.username, password: task.password };
-    let host = '';
+    // Match on `hostname`, not `host`: `host` keeps the port, so a site stored
+    // as `example.com` would never match `example.com:8443`.
+    let hostname = '';
     try {
-      host = new URL(task.url).host.toLowerCase();
+      hostname = new URL(task.url).hostname.toLowerCase();
     } catch {
       return { username: null, password: null };
     }
-    const cred = this.settings.credentials.find((c) => {
-      const site = c.site.toLowerCase().trim();
-      if (!site) return false;
-      return host === site || host.endsWith(`.${site}`) || task.url.toLowerCase().includes(site);
-    });
+    // Only an exact host or a real sub-domain may match. The old
+    // `task.url.toLowerCase().includes(site)` branch handed the stored Basic
+    // auth to any URL that merely *mentioned* the site — `http://evil/?bank.com`
+    // or `http://evil/bank.com/x.bin` both leaked the credentials.
+    const cred = this.settings.credentials.find((c) => hostMatchesSite(hostname, c.site));
     return cred ? { username: cred.username, password: cred.password } : { username: null, password: null };
   }
 
@@ -340,6 +422,11 @@ export class TaskManager extends EventEmitter {
     const controller = new AbortController();
     const running: RunningTask = {
       controller,
+      // Each start gets a fresh token. Cleanup handlers compare it before
+      // touching state so a stale run() can never abort or overwrite the run
+      // that replaced it (that race used to leave tasks permanently stuck).
+      token: ++this.runTokenSeq,
+      intent: 'running',
       windowBytes: 0,
       windowStart: Date.now(),
       speed: 0,
@@ -347,16 +434,25 @@ export class TaskManager extends EventEmitter {
       throttleStart: Date.now(),
     };
     this.running.set(id, running);
+    // A new run supersedes any previous stop bookkeeping for this task.
+    this.userStopped.delete(id);
+    this.queueStopped.delete(id);
     task.status = 'connecting';
     task.error = null;
     task.speed = 0;
     this.emit('changed');
 
     void this.run(task, running).catch((err) => {
-      this.finishRunning(id);
+      const current = this.running.get(id);
+      // A newer run owns this task now; leave it alone.
+      if (!current || current.token !== running.token) return;
+      this.running.delete(id);
+
       const code = (err as NodeJS.ErrnoException).code;
-      if (code === 'ABORTED') {
-        task.status = 'stopped';
+      const intent = running.intent;
+      if (code === 'ABORTED' || intent !== 'running') {
+        // Honour what the user actually asked for.
+        task.status = intent === 'pause' ? 'paused' : 'stopped';
       } else {
         task.status = 'error';
         task.error = {
@@ -375,9 +471,14 @@ export class TaskManager extends EventEmitter {
     return true;
   }
 
-  private finishRunning(id: string): void {
+  /**
+   * Stop the active run for a task. The caller's intent decides the terminal
+   * status, so pause() and stop() no longer both collapse into "stopped".
+   */
+  private finishRunning(id: string, intent: 'pause' | 'stop' | 'running' = 'stop'): void {
     const r = this.running.get(id);
     if (r) {
+      r.intent = intent;
       r.controller.abort();
       this.running.delete(id);
     }
@@ -386,7 +487,9 @@ export class TaskManager extends EventEmitter {
   stop(id: string): void {
     const task = this.tasks.get(id);
     if (!task) return;
-    this.finishRunning(id);
+    this.finishRunning(id, 'stop');
+    // Recorded so startQueue() does not resurrect a task the user stopped.
+    this.userStopped.add(id);
     if (task.status !== 'completed') {
       task.status = 'stopped';
       task.speed = 0;
@@ -399,7 +502,10 @@ export class TaskManager extends EventEmitter {
   pause(id: string): void {
     const task = this.tasks.get(id);
     if (!task) return;
-    this.finishRunning(id);
+    this.finishRunning(id, 'pause');
+    // A pause is not a stop: the user expects startQueue() to leave it alone,
+    // but an explicit start() must be able to resume it.
+    this.userStopped.delete(id);
     if (task.status !== 'completed') {
       task.status = 'paused';
       task.speed = 0;
@@ -410,12 +516,24 @@ export class TaskManager extends EventEmitter {
   }
 
   stopAll(): void {
-    for (const id of [...this.running.keys()]) this.stop(id);
-    for (const t of this.tasks.values()) {
-      if (t.status === 'downloading' || t.status === 'connecting' || t.status === 'queued') {
-        t.status = 'stopped';
-        t.speed = 0;
+    // Halt the scheduler for the whole operation. Each stop() used to pump the
+    // queues, and that pump started a task which had been waiting for a free
+    // slot — but the running-id snapshot was already taken, so the freshly
+    // started transfer outlived stopAll() and quietly kept writing (observed: a
+    // task still in `downloading` right after stopAll()).
+    const wasHalted = this.pumpHalted;
+    this.pumpHalted = true;
+    try {
+      for (const id of [...this.running.keys()]) this.finishRunning(id, 'stop');
+      for (const t of this.tasks.values()) {
+        if (t.status === 'downloading' || t.status === 'connecting' || t.status === 'queued') {
+          t.status = 'stopped';
+          t.speed = 0;
+          this.userStopped.add(t.id);
+        }
       }
+    } finally {
+      this.pumpHalted = wasHalted;
     }
     this.scheduleSave();
     this.emit('changed');
@@ -446,12 +564,30 @@ export class TaskManager extends EventEmitter {
     }
 
     task.mimeType = info.mimeType;
+    // A resume is only valid while the remote object is unchanged. Compare the
+    // validators captured by the previous run against the probe we just made:
+    // if the file was replaced in between, the partial bytes on disk belong to
+    // a different revision and mixing them would produce a corrupt file that we
+    // would otherwise announce as complete.
+    const changedRemotely = this.remoteObjectChanged(task, info);
+    if (changedRemotely) {
+      this.emit(
+        'log',
+        `The file changed on the server; ${task.fileName} will be downloaded again from the start.`,
+      );
+      task.segments = [];
+      task.downloadedBytes = 0;
+      task.restartedFromZero = true;
+    }
     task.etag = info.etag;
     task.lastModified = info.lastModified;
     task.supportsResume = info.supportsResume;
     task.totalBytes = info.totalBytes;
     task.status = 'downloading';
     task.startedAt = task.startedAt ?? Date.now();
+    // Sent with every ranged request so the server itself tells us when the
+    // object changed mid-transfer (it answers 200 instead of 206).
+    const ifRange = info.etag ?? info.lastModified ?? null;
 
     // Honour the server-provided name when the task kept the URL-derived one.
     if (info.fileName) {
@@ -475,18 +611,39 @@ export class TaskManager extends EventEmitter {
 
     this.emit('changed');
 
-    // Retry policy from Options > Connection.
-    retryPolicy.maxRetries = Math.max(1, this.settings.maxRetries || 8);
-    retryPolicy.retryDelayMs = Math.max(200, (this.settings.retryDelaySeconds || 5) * 1000);
+    // Retry policy is resolved per transfer (see retryPolicyFor) so that two
+    // concurrent tasks with different Options no longer overwrite each other.
 
     const wanted = this.connectionsFor(task);
     const useSegments = info.supportsResume && info.totalBytes > 0 && wanted > 1;
     if (!useSegments) {
       // Single connection; resume from whatever is already on disk.
-      await this.runSingle(task, running, options, info.totalBytes);
+      await this.runSingle(task, running, options, info.totalBytes, ifRange);
       return;
     }
-    await this.runSegmented(task, running, options, info.totalBytes, wanted);
+    await this.runSegmented(task, running, options, info.totalBytes, wanted, ifRange);
+  }
+
+  /**
+   * Whether the probe shows a different remote object than the one the local
+   * partial data belongs to.
+   *
+   * ETag is authoritative when both sides have one; `Last-Modified` is the
+   * weaker fallback used only when no ETag is available at all. A missing
+   * validator on either side is "unknown" and never restarts the transfer,
+   * because a server that does not expose validators would otherwise force a
+   * full re-download on every single resume.
+   */
+  private remoteObjectChanged(
+    task: DownloadTask,
+    info: { etag: string | null; lastModified: string | null },
+  ): boolean {
+    const before = task.etag;
+    if (before && info.etag) return before.trim() !== info.etag.trim();
+    if (before || info.etag) return false; // one side unknown: cannot prove a change
+    const beforeLm = task.lastModified;
+    if (beforeLm && info.lastModified) return beforeLm.trim() !== info.lastModified.trim();
+    return false;
   }
 
   private correctExtension(filePath: string, mime: string | null): string | null {
@@ -523,20 +680,36 @@ export class TaskManager extends EventEmitter {
     running: RunningTask,
     options: RequestOptions,
     totalBytes: number,
+    ifRange: string | null,
   ): Promise<void> {
-    let startOffset = 0;
-    try {
-      const stat = await fsp.stat(task.savePath);
-      if (stat.size > 0 && (totalBytes === 0 || stat.size < totalBytes)) startOffset = stat.size;
-    } catch {
-      startOffset = 0;
-    }
     const workPath = await this.workingPath(task);
-    const fileHandle = await prepareFile(workPath, totalBytes);
+    // Read the watermark BEFORE prepareFile preallocates, otherwise the file
+    // always looks complete and the transfer restarts from zero.
+    const onDisk = await statWorkFile(workPath);
+    const unknownLength = totalBytes === 0;
+
+    // Resume only when the bytes on disk belong to the same remote object and
+    // actually exist. Anything inconsistent is discarded and refetched, which
+    // is the only safe choice: skipping "already done" ranges that are not on
+    // disk is what used to produce all-zero files reported as completed.
+    let startOffset = 0;
+    if (!unknownLength && task.supportsResume && onDisk > 0 && onDisk < totalBytes) {
+      startOffset = onDisk;
+    }
+    if (unknownLength || !task.supportsResume || startOffset === 0) {
+      // Nothing trustworthy to keep: start from a clean file.
+      await fsp.rm(workPath, { force: true });
+    }
+
+    // The counter must describe bytes that are really on disk. It used to keep
+    // accumulating across restarts (three interrupted runs reported 150 %),
+    // which broke the percentage and the ETA.
+    task.downloadedBytes = startOffset;
+
+    // Single connection: let the file grow with the data so its size keeps
+    // meaning "bytes actually fetched" and resume can trust it.
+    const fileHandle = await prepareFile(workPath, totalBytes, { preallocate: false });
     try {
-      // With an unknown length there is nothing to range over: the whole body
-      // is streamed from the start and the file is sized from what arrives.
-      const unknownLength = totalBytes === 0;
       const segment = {
         index: 0,
         start: unknownLength ? 0 : startOffset,
@@ -549,6 +722,12 @@ export class TaskManager extends EventEmitter {
         options,
         signal: running.controller.signal,
         streamWhole: unknownLength || !task.supportsResume,
+        retry: this.retryPolicyFor(),
+        timeoutMs: this.segmentTimeoutMs(),
+        pace: (bytes) => this.pace(running, bytes),
+        // Only a genuine resume needs validating; a fresh start has no bytes
+        // whose revision could disagree with the server.
+        ifRange: startOffset > 0 ? ifRange : null,
         onChunk: (ev) => {
           this.onChunk(task, running, ev.bytes);
         },
@@ -563,8 +742,30 @@ export class TaskManager extends EventEmitter {
     } finally {
       fs.closeSync(fileHandle);
     }
+
+    // Never announce a file as complete unless the bytes are really there.
+    await this.assertComplete(task, workPath);
     await this.promoteFromTemp(task, workPath);
     this.completeTask(task);
+  }
+
+  /**
+   * Verify a finished work file before it is promoted. A size mismatch means
+   * the transfer lied about its progress, which must surface as an error
+   * instead of a "completed" task holding a broken file.
+   */
+  private async assertComplete(task: DownloadTask, workPath: string): Promise<void> {
+    const size = await statWorkFile(workPath);
+    if (size === 0 && task.totalBytes === 0) {
+      throw Object.assign(new Error('The server returned an empty file.'), { code: 'EEMPTY' });
+    }
+    if (task.totalBytes > 0 && size !== task.totalBytes) {
+      throw Object.assign(
+        new Error(`The download is incomplete: ${size} of ${task.totalBytes} bytes were written.`),
+        { code: 'EINCOMPLETE' },
+      );
+    }
+    task.downloadedBytes = size;
   }
 
   private async runSegmented(
@@ -573,21 +774,52 @@ export class TaskManager extends EventEmitter {
     options: RequestOptions,
     totalBytes: number,
     connections: number,
+    ifRange: string | null,
   ): Promise<void> {
-    // Reuse an existing plan when the size still matches so a resumed task
-    // keeps already-downloaded ranges instead of starting over.
-    if (task.segments.length === 0 || task.totalBytes !== totalBytes) {
+    const workPath = await this.workingPath(task);
+
+    // Segment progress is only meaningful together with the data it describes.
+    // The sidecar is written next to the work file, so whenever the temp files
+    // vanish (OS cleanup, changed temp folder, a different machine) the
+    // bookkeeping vanishes with them. Trusting stale counters without the bytes
+    // is what used to yield an all-zero file marked completed.
+    const onDisk = await statWorkFile(workPath);
+    const sidecar = await this.readProgressSidecar(workPath, totalBytes);
+    // The sidecar records the validator it was written under, so a file
+    // replaced on the server invalidates the bookkeeping even when the temp
+    // directory still holds data.
+    const trustworthy =
+      !!sidecar
+      && sidecar.totalBytes === totalBytes
+      && this.sameEtag(sidecar.etag, ifRange)
+      // A preallocated file is exactly totalBytes long. Anything smaller means
+      // the data we think we have is not actually there.
+      && onDisk === totalBytes
+      && sidecar.segments.length > 0;
+
+    if (!trustworthy) {
+      if (onDisk > 0 || sidecar) {
+        this.emit('log', `Discarding unverifiable partial data for ${task.fileName}; restarting it.`);
+      }
       task.segments = planSegments(totalBytes, connections);
       task.downloadedBytes = 0;
+      await fsp.rm(workPath, { force: true });
+      await fsp.rm(this.sidecarPath(workPath), { force: true });
     } else {
-      // Re-derive completed bytes from the retained segment state.
+      // Clamp restored counters so a hand-edited state file cannot overshoot.
+      task.segments = sidecar.segments.map((s) => {
+        const length = s.end - s.start + 1;
+        const done = Math.min(Math.max(0, s.downloaded), length);
+        return { index: s.index, start: s.start, end: s.end, downloaded: done };
+      });
       task.downloadedBytes = task.segments.reduce((sum, s) => sum + s.downloaded, 0);
     }
 
-    const workPath = await this.workingPath(task);
     const fileHandle = await prepareFile(workPath, totalBytes);
     try {
       const pending = task.segments.filter((s) => s.start + s.downloaded <= s.end);
+      const retry = this.retryPolicyFor();
+      const timeoutMs = this.segmentTimeoutMs();
       const results = await Promise.allSettled(
         pending.map((segment) =>
           downloadSegment(segment, {
@@ -595,7 +827,15 @@ export class TaskManager extends EventEmitter {
             fileHandle,
             options,
             signal: running.controller.signal,
-            onChunk: (ev) => this.onChunk(task, running, ev.bytes),
+            retry,
+            timeoutMs,
+            pace: (bytes) => this.pace(running, bytes),
+            // Ranges that start at 0 need no validator; the others do.
+            ifRange: segment.start + segment.downloaded > 0 ? ifRange : null,
+            onChunk: (ev) => {
+              this.onChunk(task, running, ev.bytes);
+              this.scheduleSidecarSave(task, workPath, ifRange);
+            },
           }),
         ),
       );
@@ -604,39 +844,127 @@ export class TaskManager extends EventEmitter {
     } finally {
       fs.closeSync(fileHandle);
     }
+
+    // Every range must be fully accounted for before the file is announced.
+    const short = task.segments.find((s) => s.downloaded !== s.end - s.start + 1);
+    if (short) {
+      throw Object.assign(
+        new Error(`Segment ${short.index} is incomplete (${short.downloaded} of ${short.end - short.start + 1} bytes).`),
+        { code: 'EINCOMPLETE' },
+      );
+    }
+
+    await this.assertComplete(task, workPath);
+    await fsp.rm(this.sidecarPath(workPath), { force: true });
     await this.promoteFromTemp(task, workPath);
     this.completeTask(task);
   }
 
-  private onChunk(task: DownloadTask, running: RunningTask, bytes: number): void {
-    // Global throttle: when the measured rate exceeds the cap, hold the next
-    // chunk back so the whole engine converges on the configured limit.
-    const cap = this.settings.globalSpeedLimit;
-    if (cap > 0) {
-      running.throttleBytes += bytes;
-      const nowMs = Date.now();
-      const elapsed = nowMs - running.throttleStart;
-      if (elapsed > 0) {
-        const rate = (running.throttleBytes / elapsed) * 1000;
-        if (rate > cap) {
-          const allowedMs = (running.throttleBytes / cap) * 1000;
-          const sleepMs = Math.min(200, Math.max(0, allowedMs - elapsed));
-          if (sleepMs > 0) {
-            // Synchronous pacing is acceptable here: the caller already
-            // serialises file writes, and the wait is bounded at 200 ms.
-            const until = Date.now() + sleepMs;
-            while (Date.now() < until) {
-              /* deliberate short spin to pace the producer */
-            }
-          }
-        }
-      }
-      if (nowMs - running.throttleStart > 1000) {
-        running.throttleStart = nowMs;
-        running.throttleBytes = 0;
-      }
-    }
+  private sidecarPath(workPath: string): string {
+    return `${workPath}.progress.json`;
+  }
 
+  /** Compare two ETags, treating a missing value as "unknown, still equal". */
+  private sameEtag(a: string | null | undefined, b: string | null | undefined): boolean {
+    if (!a || !b) return true;
+    return a.trim() === b.trim();
+  }
+
+  /**
+   * Debounce timers for sidecar writes, keyed by work path. A single shared
+   * timer would let one task's progress update cancel another task's write and
+   * leave the second sidecar stale on disk.
+   */
+  private sidecarTimers = new Map<string, NodeJS.Timeout>();
+
+  private scheduleSidecarSave(task: DownloadTask, workPath: string, etag: string | null): void {
+    if (this.sidecarTimers.has(workPath)) return;
+    const timer = setTimeout(() => {
+      this.sidecarTimers.delete(workPath);
+      void this.writeProgressSidecar(task, workPath, etag);
+    }, 1000);
+    this.sidecarTimers.set(workPath, timer);
+  }
+
+  private async writeProgressSidecar(
+    task: DownloadTask,
+    workPath: string,
+    etag: string | null,
+  ): Promise<void> {
+    const payload = {
+      version: 1,
+      totalBytes: task.totalBytes,
+      etag,
+      segments: task.segments.map((s) => ({
+        index: s.index, start: s.start, end: s.end, downloaded: s.downloaded,
+      })),
+    };
+    try {
+      await fsp.writeFile(this.sidecarPath(workPath), JSON.stringify(payload), 'utf8');
+    } catch {
+      /* best effort: a missing sidecar only costs a restart */
+    }
+  }
+
+  private async readProgressSidecar(
+    workPath: string,
+    totalBytes: number,
+  ): Promise<{ totalBytes: number; etag: string | null; segments: Segment[] } | null> {
+    try {
+      const raw = await fsp.readFile(this.sidecarPath(workPath), 'utf8');
+      const data = JSON.parse(raw) as {
+        version?: number; totalBytes?: number; etag?: string | null; segments?: Segment[];
+      };
+      if (data.version !== 1 || !Array.isArray(data.segments)) return null;
+      if (typeof data.totalBytes !== 'number' || data.totalBytes !== totalBytes) return null;
+      const segments = data.segments.filter(
+        (s): s is Segment =>
+          !!s && Number.isFinite(s.start) && Number.isFinite(s.end) && Number.isFinite(s.downloaded),
+      );
+      if (segments.length === 0) return null;
+      return { totalBytes: data.totalBytes, etag: data.etag ?? null, segments };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Rate limiting as an async hook. The previous implementation spun on
+   * `while (Date.now() < until)` inside the stream's data callback, which
+   * blocked the whole event loop (measured at >2 s of lag) and still exceeded
+   * the configured cap. Callers pause the stream while this promise settles.
+   *
+   * The model is a token bucket: `throttleBytes` is the amount of data that has
+   * arrived but has not yet been "paid for" at the configured rate, and it is
+   * refilled by the time that actually elapsed. Two details matter for accuracy:
+   *  - the refill per call is capped at 250 ms worth, so an idle period cannot
+   *    bank an unbounded burst that is then spent at once;
+   *  - the wait is never discarded at a window boundary. The earlier code reset
+   *    the accounting every second, which threw away the accumulated deficit and
+   *    made the transfer run ~25 % over the configured cap.
+   */
+  private async pace(running: RunningTask, bytes: number): Promise<void> {
+    const cap = this.settings.globalSpeedLimit;
+    if (cap <= 0) return;
+    const now = Date.now();
+    if (running.throttleStart <= 0) {
+      running.throttleStart = now;
+      running.throttleBytes = 0;
+    }
+    const elapsed = Math.max(0, now - running.throttleStart);
+    running.throttleStart = now;
+    // Credit for the time since the last chunk, bounded to a small burst.
+    const refill = (Math.min(elapsed, 250) / 1000) * cap;
+    running.throttleBytes = Math.max(0, running.throttleBytes - refill) + bytes;
+
+    // How long this backlog should take to drain at the configured rate.
+    const waitMs = (running.throttleBytes / cap) * 1000;
+    if (waitMs > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, Math.min(500, Math.ceil(waitMs))));
+    }
+  }
+
+  private onChunk(task: DownloadTask, running: RunningTask, bytes: number): void {
     task.downloadedBytes += bytes;
     running.windowBytes += bytes;
     this.quotaUsedToday += bytes / (1024 * 1024);
@@ -660,12 +988,22 @@ export class TaskManager extends EventEmitter {
     this.checkQuota();
   }
 
+  /** Retry policy for one transfer, taken from the current settings. */
+  private retryPolicyFor(): { maxRetries: number; retryDelayMs: number } {
+    return {
+      maxRetries: Math.max(0, Math.floor(this.settings.maxRetries ?? 8)),
+      retryDelayMs: Math.max(200, (this.settings.retryDelaySeconds ?? 5) * 1000),
+    };
+  }
+
+  /** Overall per-range deadline, generous but finite. */
+  private segmentTimeoutMs(): number {
+    return 30 * 60 * 1000;
+  }
+
   private completeTask(task: DownloadTask): void {
     const id = task.id;
-    this.finishRunning(id);
-    // Run the configured post-download hooks before announcing completion so a
-    // listener sees the final state (spec strings 1317-1319, 1164).
-    void this.runPostCompletionHooks(task);
+    this.finishRunning(id, 'running');
     task.status = 'completed';
     task.speed = 0;
     task.eta = 0;
@@ -677,6 +1015,13 @@ export class TaskManager extends EventEmitter {
     this.scheduleSave();
     this.emit('changed');
     this.emit('completed', task);
+    // Post-download hooks are deliberately fire-and-forget (a virus scan must not
+    // hold the queue), so they run after the state is final. The old comment
+    // claimed the opposite of what the code did, and the floating promise had no
+    // rejection handler, so any hook failure surfaced as an unhandled rejection.
+    void this.runPostCompletionHooks(task).catch((err: unknown) => {
+      this.emit('log', `Post-download action failed: ${(err as Error).message}`);
+    });
     this.pump();
     this.maybeRunAfterQueueAction();
   }
@@ -686,14 +1031,27 @@ export class TaskManager extends EventEmitter {
    * configured the partial data lives there and is moved into place on
    * completion, so a half-finished file never appears in the user's folder.
    */
+  /**
+   * Where a transfer writes while it is in flight.
+   *
+   * A directory that merely exists is not necessarily writable: a previous run
+   * (possibly by another user, or a container) can leave a read-only temp
+   * folder behind, and mkdir alone succeeds on it. Probing with a real write is
+   * the only reliable check, and failing that we fall back to the destination
+   * folder instead of failing every download.
+   */
   private async workingPath(task: DownloadTask): Promise<string> {
     const temp = this.settings.tempDirectory?.trim();
     if (!temp) return task.savePath;
     try {
       await fsp.mkdir(temp, { recursive: true });
+      const probeFile = path.join(temp, `.fenxidl-probe-${process.pid}`);
+      await fsp.writeFile(probeFile, '');
+      await fsp.rm(probeFile, { force: true });
       // Keep the extension so segment logic and virus scanners see the type.
       return path.join(temp, `${task.id}${path.extname(task.savePath)}.part`);
     } catch {
+      this.emit('log', `The temp folder is not writable (${temp}); staging next to the destination instead.`);
       return task.savePath;
     }
   }
@@ -722,10 +1080,14 @@ export class TaskManager extends EventEmitter {
   private async runPostCompletionHooks(task: DownloadTask): Promise<void> {
     const scan = this.settings.virusScan;
     if (scan.enabled && scan.program.trim()) {
-      const args = (scan.args || '%f').replace(/%f/g, `"${task.savePath}"`);
+      // Build the argv from the template with quote awareness: splitting on
+      // whitespace tore a path like "/tmp/a b.bin" into two arguments, so the
+      // scanner received a truncated file name. `%f` always expands to exactly
+      // one argument holding the whole path.
+      const argv = buildScanArgv(scan.args, task.savePath);
       try {
         const { spawn } = await import('node:child_process');
-        const child = spawn(scan.program, args.split(/\s+/).filter(Boolean), {
+        const child = spawn(scan.program, argv, {
           detached: true,
           stdio: 'ignore',
           windowsHide: true,
@@ -762,7 +1124,7 @@ export class TaskManager extends EventEmitter {
 
   /** Fill free slots in every queue from its queued tasks. */
   pump(): void {
-    if (this.disposed || this.quotaPaused) return;
+    if (this.disposed || this.quotaPaused || this.pumpHalted) return;
     for (const queue of this.queues) {
       const queueId = queue.isPrimary ? null : queue.id;
       let free = queue.concurrency - this.runningInQueue(queueId);
@@ -779,17 +1141,67 @@ export class TaskManager extends EventEmitter {
 
   startQueue(queueId: string | null): void {
     for (const t of this.tasks.values()) {
-      if ((t.queueId ?? null) === queueId && t.status === 'stopped') t.status = 'queued';
+      if ((t.queueId ?? null) !== queueId) continue;
+      // Resume what the queue stopped, and never resurrect what the user
+      // stopped by hand (that distinction used to be lost entirely).
+      if (t.status === 'stopped' && (!this.userStopped.has(t.id) || this.queueStopped.has(t.id))) {
+        t.status = 'queued';
+      }
     }
+    this.queueStopped.clear();
+    this.userStopped.clear();
     this.emit('changed');
     this.pump();
   }
 
+  /**
+   * Stop every task of a queue.
+   *
+   * Tasks that were waiting for a concurrency slot are only "held": they never
+   * started, so they are parked in `stopped` while recording that the stop came
+   * from the queue and not from the user. A task the user stopped on purpose
+   * keeps `queueStopped = false`, which lets startQueue() tell the two apart.
+   */
   stopQueue(queueId: string | null): void {
-    for (const t of [...this.tasks.values()]) {
-      if ((t.queueId ?? null) === queueId && (t.status === 'queued' || t.status === 'downloading' || t.status === 'connecting')) {
-        this.stop(t.id);
+    // Same hazard as stopAll(): stop() pumps, and an abort triggered here can
+    // free a slot for a task of *another* queue before this loop finishes.
+    const wasHalted = this.pumpHalted;
+    this.pumpHalted = true;
+    try {
+      for (const t of [...this.tasks.values()]) {
+        if ((t.queueId ?? null) !== queueId) continue;
+        if (t.status === 'queued') {
+          // Never started: remember that this was a queue-level stop so a later
+          // startQueue() can put it back without reviving user-stopped tasks.
+          t.status = 'stopped';
+          t.speed = 0;
+          this.queueStopped.add(t.id);
+        } else if (t.status === 'downloading' || t.status === 'connecting') {
+          // Park it under the queue's authority, not the user's: stop() marks
+          // the task user-stopped, which would block startQueue() from
+          // resuming it.
+          this.stopInternal(t.id);
+          this.queueStopped.add(t.id);
+        }
       }
+    } finally {
+      this.pumpHalted = wasHalted;
+    }
+    this.scheduleSave();
+    this.emit('changed');
+  }
+
+  /**
+   * The part of {@link stop} that changes state, without touching the user-stop
+   * bookkeeping or pumping. Used by stopQueue(), which owns both decisions.
+   */
+  private stopInternal(id: string): void {
+    const task = this.tasks.get(id);
+    if (!task) return;
+    this.finishRunning(id, 'stop');
+    if (task.status !== 'completed') {
+      task.status = 'stopped';
+      task.speed = 0;
     }
   }
 
@@ -844,6 +1256,8 @@ export class TaskManager extends EventEmitter {
   }
 
   private lastScheduleRun = new Map<string, string>();
+  /** When each interval schedule last fired, in epoch ms. */
+  private lastIntervalRunAt = new Map<string, number>();
 
   /** Called once per minute to fire due schedule entries. */
   tickSchedules(): void {
@@ -882,9 +1296,19 @@ export class TaskManager extends EventEmitter {
         if (entry.timeOfDay === null) return null;
         if ((entry.weekdays & (1 << day)) === 0) return null;
         return entry.timeOfDay === minutes ? stamp : null;
-      case 'interval':
+      case 'interval': {
         if (!entry.intervalMinutes || entry.intervalMinutes <= 0) return null;
-        return minutes % entry.intervalMinutes === 0 ? stamp : null;
+        // Deduplicate on elapsed time rather than on the wall clock: the old
+        // "minutes % interval === 0" test both missed ticks (the 30 s timer
+        // rarely lands exactly on the minute) and, because the dedup key was
+        // the date alone, fired at most once per day.
+        const nowMs = now.getTime();
+        const last = this.lastIntervalRunAt.get(entry.id);
+        const periodMs = entry.intervalMinutes * 60_000;
+        if (last !== undefined && nowMs - last < periodMs) return null;
+        this.lastIntervalRunAt.set(entry.id, nowMs);
+        return `${stamp}#${Math.floor(nowMs / periodMs)}`;
+      }
       default:
         return null;
     }
@@ -926,7 +1350,13 @@ export class TaskManager extends EventEmitter {
     if (this.quotaPaused) return;
     this.quotaPaused = true;
     for (const t of [...this.tasks.values()]) {
-      if (t.status === 'downloading' || t.status === 'connecting') this.pause(t.id);
+      if (t.status === 'downloading' || t.status === 'connecting') {
+        // Remember who was paused *by the quota*: clearing the latch has to
+        // resume exactly these tasks, because pump() only ever starts tasks in
+        // the `queued` state and a paused task would otherwise stay stuck.
+        this.quotaPausedIds.add(t.id);
+        this.pause(t.id);
+      }
     }
     this.emit(
       'quotaExceeded',
@@ -935,27 +1365,61 @@ export class TaskManager extends EventEmitter {
     );
   }
 
+  /** Put tasks that the quota paused back into the queue. */
+  private resumeFromQuota(): void {
+    const ids = [...this.quotaPausedIds];
+    this.quotaPausedIds.clear();
+    for (const id of ids) {
+      const task = this.tasks.get(id);
+      if (!task) continue;
+      if (task.status === 'paused' || task.status === 'stopped') {
+        task.status = 'queued';
+        task.speed = 0;
+      }
+    }
+    if (ids.length > 0) {
+      this.emit('changed');
+      this.scheduleSave();
+    }
+    this.pump();
+  }
+
   /** Re-evaluate the quota window; a new day or period clears the pause. */
   private resetQuotaIfNeeded(): void {
+    const q = this.settings.quota;
+
+    // Turning the quota off (or raising the allowance above what was used)
+    // must release the latch immediately. It used to stay set forever, so the
+    // only way out was restarting the app.
+    if (!q.enabled || q.megabytes <= 0 || this.quotaUsedToday < q.megabytes) {
+      if (this.quotaPaused) {
+        this.quotaPaused = false;
+        this.emit('log', 'The download quota is no longer exceeded; resuming.');
+        this.resumeFromQuota();
+      }
+    }
+
     const key = this.currentQuotaKey();
     if (key !== this.quotaWindowKey) {
       this.quotaWindowKey = key;
       this.quotaUsedToday = 0;
       this.quotaPaused = false;
       this.scheduleSave();
-      this.pump();
+      this.resumeFromQuota();
       return;
     }
-    if (this.quotaPaused) {
-      const q = this.settings.quota;
+    if (this.quotaPaused && q.enabled && q.megabytes > 0) {
       const now = new Date();
       const minutes = now.getHours() * 60 + now.getMinutes();
       const inWindow = q.startMinute <= q.endMinute
         ? minutes >= q.startMinute && minutes <= q.endMinute
         : minutes >= q.startMinute || minutes <= q.endMinute;
+      // Outside the window the transfer is allowed again, and the next window
+      // gives the user a fresh allowance for the day.
       if (!inWindow) {
+        this.quotaUsedToday = 0;
         this.quotaPaused = false;
-        this.pump();
+        this.resumeFromQuota();
       }
     }
   }
@@ -1001,6 +1465,10 @@ export class TaskManager extends EventEmitter {
     if (this.saveTimer) clearTimeout(this.saveTimer);
     if (this.schedulerTimer) clearInterval(this.schedulerTimer);
     if (this.quotaTimer) clearInterval(this.quotaTimer);
+    // Pending sidecar writes would otherwise keep the process alive and touch
+    // files after the manager is gone.
+    for (const timer of this.sidecarTimers.values()) clearTimeout(timer);
+    this.sidecarTimers.clear();
     for (const id of [...this.running.keys()]) this.finishRunning(id);
     await this.saveNow();
   }

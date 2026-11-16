@@ -5,12 +5,22 @@
     "moduleResolution": "bundler",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "jsx": "react-jsx",
+
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noImplicitOverride": true,
     "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    "allowUnreachableCode": false,
+    "allowUnusedLabels": false,
+
+    // Off today, on once the remaining strictness debt is paid down.
+    // `--exactOptionalPropertyTypes` currently reports 12 errors on the baseline
+    // tree (see reports/infra.md R4); `noUncheckedIndexedAccess` reports 58.
+    // Turn these on per-file or after the debt list is cleared, not before.
     "exactOptionalPropertyTypes": false,
+
     "forceConsistentCasingInFileNames": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
@@ -19,5 +29,6 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx"]
+  "include": ["src/**/*.ts", "src/**/*.tsx"],
+  "exclude": ["node_modules", "dist", "release"]
 }

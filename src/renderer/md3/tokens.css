@@ -14,18 +14,28 @@
   --md-on-primary-container: #c2e7ff;
   --md-primary-fixed: #c2e7ff;
   --md-primary-fixed-dim: #89ceff;
+  --md-on-primary-fixed: #001d33;
+  --md-on-primary-fixed-variant: #00497a;
 
   /* ---- Secondary ---- */
   --md-secondary: #bbc7db;
   --md-on-secondary: #253141;
   --md-secondary-container: #3b4858;
   --md-on-secondary-container: #d7e3f7;
+  --md-secondary-fixed: #d4e4f6;
+  --md-secondary-fixed-dim: #b8c8da;
+  --md-on-secondary-fixed: #0d1d2a;
+  --md-on-secondary-fixed-variant: #3a4857;
 
   /* ---- Tertiary ---- */
   --md-tertiary: #d5bee6;
   --md-on-tertiary: #3a2b49;
   --md-tertiary-container: #51425f;
   --md-on-tertiary-container: #f1daff;
+  --md-tertiary-fixed: #f0dbff;
+  --md-tertiary-fixed-dim: #d7bde8;
+  --md-on-tertiary-fixed: #241432;
+  --md-on-tertiary-fixed-variant: #51425f;
 
   /* ---- Error ---- */
   --md-error: #ffb4ab;
@@ -46,8 +56,13 @@
   --md-on-surface: #e0e3e8;
   --md-on-surface-variant: #c1c7ce;
   --md-surface-variant: #41474d;
+  --md-surface-tint: var(--md-primary);
 
   --md-outline: #8b9198;
+  /* Structural separators (table rows, list items) need ≥3:1 so rows stay
+     scannable. `outline-variant` is only 1.97:1 and is reserved for purely
+     decorative rules (section underlines, rail dividers). */
+  --md-outline-strong: #6b7279;
   --md-outline-variant: #41474d;
 
   --md-inverse-surface: #e0e3e8;
@@ -67,7 +82,29 @@
   --md-info-container: #00487a;
   --md-on-info-container: #d1e4ff;
 
-  /* ---- Typescale (MD3) ---- */
+  /* ---- File-type glyph palette (container / on-container pairs) ----
+     These replace the seven hard-coded hex values that used to live in
+     `main.tsx:fileColor()`. Every pair is designed so the 3-letter glyph
+     reaches at least 4.5:1 against its own container. */
+  --md-file-program-bg: #4a3a86;
+  --md-file-program-fg: #e9ddff;
+  --md-file-archive-bg: #4b3900;
+  --md-file-archive-fg: #ffe08b;
+  --md-file-video-bg: #6b1f1c;
+  --md-file-video-fg: #ffdad6;
+  --md-file-audio-bg: #00522a;
+  --md-file-audio-fg: #89f8a6;
+  --md-file-image-bg: #00464f;
+  --md-file-image-fg: #a5e9f5;
+  --md-file-doc-bg: #00325a;
+  --md-file-doc-fg: #d1e4ff;
+  --md-file-default-bg: #31353a;
+  --md-file-default-fg: #e0e3e8;
+
+  /* ---- Typescale (MD3) ----
+     `font:` is a shorthand and cannot carry `letter-spacing`, so each step
+     ships a matching `--md-ls-*` value that the helper classes apply as a
+     separate declaration. Values come from the m3.material.io typescale. */
   --md-font: "Roboto", -apple-system, BlinkMacSystemFont, "Segoe UI",
     "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", "Source Han Sans SC",
     "Noto Sans CJK SC", "Noto Sans SC", sans-serif;
@@ -94,8 +131,28 @@
   --md-label-medium: 500 12px/16px var(--md-font);
   --md-label-small: 500 11px/16px var(--md-font);
 
+  /* Letter-spacing per MD3 step. The interface is primarily CJK, where the
+     Latin tracking values read slightly loose on long paragraphs; body-large
+     is therefore pulled from 0.5px to 0.25px as a documented deviation (MD3
+     itself allows CJK-specific tracking). Everything else keeps the spec
+     value. */
+  --md-ls-display: -0.25px;
+  --md-ls-headline-large: 0px;
+  --md-ls-headline-medium: 0px;
+  --md-ls-headline-small: 0px;
+  --md-ls-title-large: 0px;
+  --md-ls-title-medium: 0.15px;
+  --md-ls-title-small: 0.1px;
+  --md-ls-body-large: 0.25px; /* MD3 0.5px, reduced for CJK (documented) */
+  --md-ls-body-medium: 0.25px;
+  --md-ls-body-small: 0.4px;
+  --md-ls-label-large: 0.1px;
+  --md-ls-label-medium: 0.5px;
+  --md-ls-label-small: 0.5px;
+
   /* ---- Shape scale ---- */
   --md-shape-none: 0;
+  --md-shape-checkbox: 2px; /* MD3 checkbox corner */
   --md-shape-xs: 4px;
   --md-shape-sm: 8px;
   --md-shape-md: 12px;
@@ -125,15 +182,49 @@
   --md-dur-long1: 450ms;
   --md-dur-long2: 500ms;
 
-  /* ---- State layer opacities (MD3 spec) ---- */
+  /* ---- State layer opacities (MD3 spec) ----
+     The numeric form is kept for JS/`calc()` consumers; the `*-pct` twins are
+     what `color-mix()` consumes directly, so the spec values are referenced
+     from CSS instead of being re-typed as literal percentages. */
   --md-state-hover: 0.08;
+  --md-state-hover-pct: 8%;
   --md-state-focus: 0.10;
+  --md-state-focus-pct: 10%;
   --md-state-pressed: 0.10;
+  --md-state-pressed-pct: 10%;
   --md-state-dragged: 0.16;
+  --md-state-dragged-pct: 16%;
+  --md-state-disabled: 0.38;
+  --md-scrim-opacity: 60%;
 
   /* ---- Layout ---- */
   --md-rail-width: 80px;
+  --md-rail-item-width: 72px;
+  --md-rail-item-min-height: 64px;
+  --md-rail-indicator-width: 56px;
+  --md-rail-indicator-height: 32px;
+  --md-rail-divider-width: 40px;
+  --md-rail-padding: 12px;
+  --md-rail-gap: 4px;
+  --md-rail-count-size: 18px;
+  --md-rail-flyout-width: 240px;
   --md-appbar-height: 64px;
+
+  /* Minimum interactive target. WCAG 2.5.5 (AA) asks for 44px; MD3 asks for
+     48dp. The app targets 48dp everywhere, so a single token drives every
+     control's floor. */
+  --md-touch-min: 48px;
+  --md-icon-btn-size: 48px;
+  --md-table-row-height: 48px;
+  --md-search-min-width: 220px;
+  --md-glyph-size: 32px;
+  --md-glyph-size-sm: 28px;
+  --md-mono-size: 14px;
+  --md-icon-size: 20px;
+  --md-icon-size-sm: 18px;
+  --md-badge-height: 24px;
+  --md-queue-marker-min-width: 20px;
+  --md-dialog-max-height: calc(100vh - 64px);
 }
 
 /* Light scheme — applied by [data-theme="light"] on <html>. */
@@ -146,16 +237,26 @@
   --md-on-primary-container: #001d33;
   --md-primary-fixed: #cde5ff;
   --md-primary-fixed-dim: #93ccff;
+  --md-on-primary-fixed: #001d33;
+  --md-on-primary-fixed-variant: #00497a;
 
   --md-secondary: #51606f;
   --md-on-secondary: #ffffff;
   --md-secondary-container: #d4e4f6;
   --md-on-secondary-container: #0d1d2a;
+  --md-secondary-fixed: #d4e4f6;
+  --md-secondary-fixed-dim: #b8c8da;
+  --md-on-secondary-fixed: #0d1d2a;
+  --md-on-secondary-fixed-variant: #3a4857;
 
   --md-tertiary: #695779;
   --md-on-tertiary: #ffffff;
   --md-tertiary-container: #f0dbff;
   --md-on-tertiary-container: #241432;
+  --md-tertiary-fixed: #f0dbff;
+  --md-tertiary-fixed-dim: #d7bde8;
+  --md-on-tertiary-fixed: #241432;
+  --md-on-tertiary-fixed-variant: #51425f;
 
   --md-error: #ba1a1a;
   --md-on-error: #ffffff;
@@ -174,10 +275,21 @@
   --md-on-surface: #191c20;
   --md-on-surface-variant: #41474d;
   --md-surface-variant: #dfe2eb;
+  --md-surface-tint: var(--md-primary);
 
   --md-outline: #71787e;
+  /* 3.4:1 on --md-surface-container-high, matching the dark scheme's
+     structural separator (dark #6b7279 is 3.36:1 on the same role). */
+  --md-outline-strong: #767d84;
   --md-outline-variant: #c1c7ce;
 
+  /* scrim/shadow are black in both schemes. Stated explicitly so a reader can
+     tell "deliberate" apart from "forgotten"; `--md-shadow` feeds the
+     elevation recipes above. */
+  --md-scrim: #000000;
+  --md-shadow: #000000;
+
+  /* inverse roles must swap: the snackbar is a dark slab on a light UI. */
   --md-inverse-surface: #2e3135;
   --md-inverse-on-surface: #eff0f5;
   --md-inverse-primary: #93ccff;
@@ -192,7 +304,25 @@
   --md-info-container: #cde5ff;
   --md-on-info-container: #001d33;
 
+  /* Light counterparts of the file-type glyph pairs. */
+  --md-file-program-bg: #e9ddff;
+  --md-file-program-fg: #2a1a5e;
+  --md-file-archive-bg: #ffe08b;
+  --md-file-archive-fg: #3a2c00;
+  --md-file-video-bg: #ffdad6;
+  --md-file-video-fg: #561412;
+  --md-file-audio-bg: #89f8a6;
+  --md-file-audio-fg: #00391a;
+  --md-file-image-bg: #a5e9f5;
+  --md-file-image-fg: #00323a;
+  --md-file-doc-bg: #d1e4ff;
+  --md-file-doc-fg: #001f3a;
+  --md-file-default-bg: #e0e2e8;
+  --md-file-default-fg: #191c20;
+
   --md-elevation-1: 0 1px 2px rgba(0, 0, 0, 0.3), 0 1px 3px 1px rgba(0, 0, 0, 0.15);
   --md-elevation-2: 0 1px 2px rgba(0, 0, 0, 0.3), 0 2px 6px 2px rgba(0, 0, 0, 0.15);
   --md-elevation-3: 0 4px 8px 3px rgba(0, 0, 0, 0.15), 0 1px 3px rgba(0, 0, 0, 0.3);
+  --md-elevation-4: 0 6px 10px 4px rgba(0, 0, 0, 0.15), 0 2px 3px rgba(0, 0, 0, 0.3);
+  --md-elevation-5: 0 8px 12px 6px rgba(0, 0, 0, 0.15), 0 4px 4px rgba(0, 0, 0, 0.3);
 }

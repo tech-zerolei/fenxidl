@@ -19,6 +19,7 @@ body {
   background: var(--md-surface);
   color: var(--md-on-surface);
   font: var(--md-body-medium);
+  letter-spacing: var(--md-ls-body-medium);
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
@@ -48,7 +49,7 @@ textarea {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--md-outline-variant);
+  background: var(--md-outline-strong);
   border-radius: var(--md-shape-full);
   border: 2px solid transparent;
   background-clip: content-box;
@@ -60,23 +61,26 @@ textarea {
 
 /* ============================================================================
    Typography helpers
+
+   `font:` cannot carry letter-spacing, so every step pairs the shorthand with
+   its own `--md-ls-*` value. The base is set in tokens.css per MD3.
    ============================================================================ */
 
-.md-display-large { font: var(--md-display-large); }
-.md-display-medium { font: var(--md-display-medium); }
-.md-display-small { font: var(--md-display-small); }
-.md-headline-large { font: var(--md-headline-large); }
-.md-headline-medium { font: var(--md-headline-medium); }
-.md-headline-small { font: var(--md-headline-small); }
-.md-title-large { font: var(--md-title-large); }
-.md-title-medium { font: var(--md-title-medium); }
-.md-title-small { font: var(--md-title-small); }
-.md-body-large { font: var(--md-body-large); }
-.md-body-medium { font: var(--md-body-medium); }
-.md-body-small { font: var(--md-body-small); }
-.md-label-large { font: var(--md-label-large); }
-.md-label-medium { font: var(--md-label-medium); }
-.md-label-small { font: var(--md-label-small); }
+.md-display-large { font: var(--md-display-large); letter-spacing: var(--md-ls-display); }
+.md-display-medium { font: var(--md-display-medium); letter-spacing: var(--md-ls-display); }
+.md-display-small { font: var(--md-display-small); letter-spacing: var(--md-ls-display); }
+.md-headline-large { font: var(--md-headline-large); letter-spacing: var(--md-ls-headline-large); }
+.md-headline-medium { font: var(--md-headline-medium); letter-spacing: var(--md-ls-headline-medium); }
+.md-headline-small { font: var(--md-headline-small); letter-spacing: var(--md-ls-headline-small); }
+.md-title-large { font: var(--md-title-large); letter-spacing: var(--md-ls-title-large); }
+.md-title-medium { font: var(--md-title-medium); letter-spacing: var(--md-ls-title-medium); }
+.md-title-small { font: var(--md-title-small); letter-spacing: var(--md-ls-title-small); }
+.md-body-large { font: var(--md-body-large); letter-spacing: var(--md-ls-body-large); }
+.md-body-medium { font: var(--md-body-medium); letter-spacing: var(--md-ls-body-medium); }
+.md-body-small { font: var(--md-body-small); letter-spacing: var(--md-ls-body-small); }
+.md-label-large { font: var(--md-label-large); letter-spacing: var(--md-ls-label-large); }
+.md-label-medium { font: var(--md-label-medium); letter-spacing: var(--md-ls-label-medium); }
+.md-label-small { font: var(--md-label-small); letter-spacing: var(--md-ls-label-small); }
 .md-mono { font-family: var(--md-font-mono); font-size: 0.857em; }
 
 /* ============================================================================
@@ -112,14 +116,46 @@ textarea {
   user-select: none;
   position: relative;
   z-index: 4;
+  transition:
+    background var(--md-dur-short3) var(--md-ease-standard),
+    color var(--md-dur-short3) var(--md-ease-standard);
 }
 
 .md-top-app-bar.scrolled {
   box-shadow: var(--md-elevation-2);
 }
 
+/* Contextual app bar (MD3): selecting rows switches the bar into
+   selection mode, which must be visible without reading the title. The bar
+   moves to the secondary-container tonal step and the icon actions inherit
+   that container's foreground. */
+.md-top-app-bar.contextual {
+  background: var(--md-secondary-container);
+  color: var(--md-on-secondary-container);
+}
+
+.md-top-app-bar.contextual .md-icon-btn {
+  color: var(--md-on-secondary-container);
+}
+
+.md-top-app-bar.contextual .md-icon-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--md-on-secondary-container) var(--md-state-hover-pct), transparent);
+}
+
+.md-top-app-bar.contextual .md-icon-btn:active:not(:disabled) {
+  background: color-mix(in srgb, var(--md-on-secondary-container) var(--md-state-pressed-pct), transparent);
+}
+
+/* Selection mode is an explicit mode switch: the title drops to title-medium
+   per MD3's contextual app-bar spec so the actions read as the primary row. */
+.md-top-app-bar.contextual .md-top-app-bar__title {
+  font: var(--md-title-medium);
+  letter-spacing: var(--md-ls-title-medium);
+}
+
 .md-top-app-bar__title {
   font: var(--md-title-large);
+  letter-spacing: var(--md-ls-title-large);
   display: flex;
   align-items: center;
   gap: 12px;
@@ -128,6 +164,7 @@ textarea {
 
 .md-top-app-bar__subtitle {
   font: var(--md-body-small);
+  letter-spacing: var(--md-ls-body-small);
   color: var(--md-on-surface-variant);
   margin-left: 2px;
 }
@@ -136,29 +173,94 @@ textarea {
   margin-left: auto;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 4px;
 }
 
 /* ============================================================================
    Navigation rail (MD3)
+
+   MD3 caps a rail at 3–7 destinations. The seven file-type filters therefore
+   live behind a single "分类" destination that opens a flyout panel, leaving
+   the rail with 3 primary views + 1 category entry + the About footer, which
+   fits without scrolling at both 1180×720 and 900×520.
    ============================================================================ */
+
+.md-nav-rail-wrap {
+  position: relative;
+  flex: 0 0 var(--md-rail-width);
+  display: flex;
+  min-height: 0;
+}
 
 .md-nav-rail {
   width: var(--md-rail-width);
-  flex: 0 0 var(--md-rail-width);
+  flex: 1 1 auto;
   background: var(--md-surface-container-low);
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding: 12px 0;
-  gap: 4px;
+  padding: var(--md-rail-padding) 0;
+  gap: var(--md-rail-gap);
+  /* Belt and braces: the destinations now fit, but if a future addition
+     overflows, a thin scrollbar plus the fade overlays below make it obvious
+     that there is more above/below. */
   overflow-y: auto;
   overflow-x: hidden;
+  scrollbar-width: thin;
   border-right: 1px solid var(--md-outline-variant);
+}
+
+/* Top/bottom fade overlays. They live outside the scroll container so they
+   stay pinned while the content scrolls, and are only rendered when there is
+   actually something hidden in that direction. */
+.md-nav-rail__fade {
+  position: absolute;
+  left: 0;
+  right: 1px; /* do not paint over the 1px divider */
+  height: 20px;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.md-nav-rail__fade--top {
+  top: 0;
+  background: linear-gradient(var(--md-surface-container-low), transparent);
+}
+
+.md-nav-rail__fade--bottom {
+  bottom: 0;
+  background: linear-gradient(transparent, var(--md-surface-container-low));
 }
 
 .md-nav-rail__fab {
   margin-bottom: 12px;
+  flex: 0 0 auto;
+}
+
+/* Collapsible destination group. Folding the file-type shortcuts in here keeps
+   the rail to MD3's 3-7 destinations so nothing is clipped at 520px height. */
+.md-nav-rail__group {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--md-rail-gap);
+  flex: 0 0 auto;
+}
+
+.md-nav-rail__group-items {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--md-rail-gap);
+  padding-left: 6px;
+  border-left: 1px solid var(--md-outline-variant);
+  margin-left: 2px;
+}
+
+.md-nav-rail__group-items[hidden] {
+  display: none;
 }
 
 .md-nav-rail__item {
@@ -166,20 +268,24 @@ textarea {
   flex-direction: column;
   align-items: center;
   gap: 4px;
-  width: 72px;
+  width: var(--md-rail-item-width);
+  min-height: var(--md-rail-item-min-height);
   padding: 6px 0;
   border: 0;
   background: transparent;
   cursor: pointer;
   color: var(--md-on-surface-variant);
   border-radius: var(--md-shape-md);
-  transition: color var(--md-dur-short3) var(--md-ease-standard);
+  transition:
+    color var(--md-dur-short3) var(--md-ease-standard),
+    background var(--md-dur-short3) var(--md-ease-standard);
+  flex: 0 0 auto;
 }
 
 .md-nav-rail__indicator {
   position: relative;
-  width: 56px;
-  height: 32px;
+  width: var(--md-rail-indicator-width);
+  height: var(--md-rail-indicator-height);
   border-radius: var(--md-shape-full);
   display: grid;
   place-items: center;
@@ -187,7 +293,19 @@ textarea {
 }
 
 .md-nav-rail__item:hover .md-nav-rail__indicator {
-  background: color-mix(in srgb, var(--md-on-surface) 8%, transparent);
+  background: color-mix(in srgb, var(--md-on-surface) var(--md-state-hover-pct), transparent);
+}
+
+.md-nav-rail__item:active .md-nav-rail__indicator {
+  background: color-mix(in srgb, var(--md-on-surface) var(--md-state-pressed-pct), transparent);
+}
+
+/* MD3 defines a focus state layer (10%) distinct from hover (8%). It was
+   declared in tokens.css but never applied anywhere, so keyboard focus in the
+   rail relied on the outline alone against a surface at rest. Applying it to
+   the indicator matches how hover/pressed already work. */
+.md-nav-rail__item:focus-visible .md-nav-rail__indicator {
+  background: color-mix(in srgb, var(--md-on-surface) var(--md-state-focus-pct), transparent);
 }
 
 .md-nav-rail__item[aria-current="page"] .md-nav-rail__indicator {
@@ -200,41 +318,171 @@ textarea {
 }
 
 .md-nav-rail__icon {
-  font-size: 20px;
+  font-size: var(--md-icon-size);
   line-height: 1;
 }
 
 .md-nav-rail__label {
   font: var(--md-label-medium);
-  max-width: 72px;
+  letter-spacing: var(--md-ls-label-medium);
+  max-width: var(--md-rail-item-width);
   text-align: center;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+/* Count badge. `primary-container` means "has content"; `error` is reserved
+   for the error category so a red dot keeps its urgency. */
 .md-nav-rail__count {
   position: absolute;
   top: -2px;
-  right: 4px;
-  min-width: 16px;
-  height: 16px;
+  right: 2px;
+  min-width: var(--md-rail-count-size);
+  height: var(--md-rail-count-size);
   padding: 0 4px;
   border-radius: var(--md-shape-full);
-  background: var(--md-error);
-  color: var(--md-on-error);
+  background: var(--md-primary-container);
+  color: var(--md-on-primary-container);
   font: var(--md-label-small);
+  letter-spacing: var(--md-ls-label-small);
   display: grid;
   place-items: center;
-  font-size: 10px;
+}
+
+.md-nav-rail__count.error {
+  background: var(--md-error);
+  color: var(--md-on-error);
 }
 
 .md-nav-rail__divider {
-  width: 40px;
+  width: var(--md-rail-divider-width);
   height: 1px;
   background: var(--md-outline-variant);
   margin: 8px 0;
   border: 0;
+  flex: 0 0 auto;
+}
+
+/* ---- Rail category flyout --------------------------------------------------
+   The seven file-type filters are one level down: a flyout panel anchored to
+   the rail. It is a real MD3 menu surface: it traps Esc, returns focus to the
+   trigger, and scrolls internally when the window is short. */
+
+.md-rail-category {
+  position: relative;
+  display: flex;
+  flex: 0 0 auto;
+}
+
+.md-rail-category-panel {
+  /* Fixed, not absolute: NavigationRail measures the trigger with
+     getBoundingClientRect() (viewport coordinates) and writes them into
+     `left`/`top` plus a viewport-derived `max-height`. With `absolute` those
+     numbers were resolved against .md-nav-rail-wrap, which starts below the
+     64px app bar, so the panel was painted 64px lower than measured and its
+     bottom fell 52px past the viewport at BOTH 1180x720 and 900x520 — the
+     last two file-type entries were unreachable without scrolling. `fixed`
+     makes the coordinate space match the measurement, and also keeps the
+     panel out of the rail's own scroll box. */
+  position: fixed;
+  z-index: 30;
+  width: var(--md-rail-flyout-width);
+  max-height: min(420px, calc(100vh - 96px));
+  overflow-y: auto;
+  scrollbar-width: thin;
+  padding: 8px;
+  background: var(--md-surface-container-high);
+  color: var(--md-on-surface);
+  border-radius: var(--md-shape-md);
+  box-shadow: var(--md-elevation-3);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  animation: md-flyout-in var(--md-dur-short3) var(--md-ease-standard);
+}
+
+@keyframes md-flyout-in {
+  from { opacity: 0; transform: translateX(-4px); }
+  to { opacity: 1; transform: none; }
+}
+
+.md-rail-category-panel__headline {
+  font: var(--md-label-large);
+  letter-spacing: var(--md-ls-label-large);
+  color: var(--md-on-surface-variant);
+  padding: 8px 12px 4px;
+}
+
+.md-rail-category-panel__item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: var(--md-touch-min);
+  padding: 0 12px;
+  border: 0;
+  border-radius: var(--md-shape-sm);
+  background: transparent;
+  color: var(--md-on-surface);
+  font: var(--md-body-medium);
+  letter-spacing: var(--md-ls-body-medium);
+  cursor: pointer;
+  text-align: left;
+  transition: background var(--md-dur-short2) var(--md-ease-standard);
+}
+
+.md-rail-category-panel__item:hover {
+  background: color-mix(in srgb, var(--md-on-surface) var(--md-state-hover-pct), transparent);
+}
+
+.md-rail-category-panel__item:active {
+  background: color-mix(in srgb, var(--md-on-surface) var(--md-state-pressed-pct), transparent);
+}
+
+.md-rail-category-panel__item[aria-current="true"] {
+  background: var(--md-secondary-container);
+  color: var(--md-on-secondary-container);
+}
+
+.md-rail-category-panel__label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.md-rail-category-panel__count {
+  font: var(--md-label-small);
+  letter-spacing: var(--md-ls-label-small);
+  font-variant-numeric: tabular-nums;
+  color: var(--md-on-surface-variant);
+}
+
+.md-rail-category-panel__item[aria-current="true"] .md-rail-category-panel__count {
+  color: var(--md-on-secondary-container);
+}
+
+/* Toolbar strip above the task table: holds queue actions that must stay
+   reachable regardless of the selection state. Only the bottom edge is
+   structural, so it uses the stronger outline role. */
+.md-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: var(--md-surface-container-low);
+  border-bottom: 1px solid var(--md-outline-strong);
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+}
+
+.md-toolbar-separator {
+  width: 1px;
+  height: 24px;
+  background: var(--md-outline-strong);
+  flex: 0 0 auto;
 }
 
 /* ============================================================================
@@ -247,11 +495,12 @@ textarea {
   align-items: center;
   justify-content: center;
   gap: 8px;
-  height: 40px;
+  min-height: var(--md-touch-min);
   padding: 0 24px;
   border: 0;
   border-radius: var(--md-shape-full);
   font: var(--md-label-large);
+  letter-spacing: var(--md-ls-label-large);
   cursor: pointer;
   overflow: hidden;
   white-space: nowrap;
@@ -263,11 +512,11 @@ textarea {
 
 .md-btn:disabled {
   cursor: default;
-  opacity: 0.38;
+  opacity: var(--md-state-disabled);
 }
 
 .md-btn__icon {
-  font-size: 18px;
+  font-size: var(--md-icon-size-sm);
   line-height: 1;
 }
 
@@ -278,6 +527,10 @@ textarea {
 }
 .md-btn--filled:hover:not(:disabled) {
   box-shadow: var(--md-elevation-1);
+  background: color-mix(in srgb, var(--md-on-primary) var(--md-state-hover-pct), var(--md-primary));
+}
+.md-btn--filled:active:not(:disabled) {
+  background: color-mix(in srgb, var(--md-on-primary) var(--md-state-pressed-pct), var(--md-primary));
 }
 
 /* Tonal */
@@ -287,6 +540,10 @@ textarea {
 }
 .md-btn--tonal:hover:not(:disabled) {
   box-shadow: var(--md-elevation-1);
+  background: color-mix(in srgb, var(--md-on-secondary-container) var(--md-state-hover-pct), var(--md-secondary-container));
+}
+.md-btn--tonal:active:not(:disabled) {
+  background: color-mix(in srgb, var(--md-on-secondary-container) var(--md-state-pressed-pct), var(--md-secondary-container));
 }
 
 /* Outlined */
@@ -296,7 +553,10 @@ textarea {
   border: 1px solid var(--md-outline);
 }
 .md-btn--outlined:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--md-primary) 8%, transparent);
+  background: color-mix(in srgb, var(--md-primary) var(--md-state-hover-pct), transparent);
+}
+.md-btn--outlined:active:not(:disabled) {
+  background: color-mix(in srgb, var(--md-primary) var(--md-state-pressed-pct), transparent);
 }
 
 /* Text */
@@ -306,7 +566,10 @@ textarea {
   padding: 0 12px;
 }
 .md-btn--text:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--md-primary) 8%, transparent);
+  background: color-mix(in srgb, var(--md-primary) var(--md-state-hover-pct), transparent);
+}
+.md-btn--text:active:not(:disabled) {
+  background: color-mix(in srgb, var(--md-primary) var(--md-state-pressed-pct), transparent);
 }
 
 /* Elevated */
@@ -317,12 +580,22 @@ textarea {
 }
 .md-btn--elevated:hover:not(:disabled) {
   box-shadow: var(--md-elevation-2);
+  background: color-mix(in srgb, var(--md-primary) var(--md-state-hover-pct), var(--md-surface-container-low));
+}
+.md-btn--elevated:active:not(:disabled) {
+  background: color-mix(in srgb, var(--md-primary) var(--md-state-pressed-pct), var(--md-surface-container-low));
 }
 
 /* Error/destructive */
 .md-btn--danger {
   background: var(--md-error);
   color: var(--md-on-error);
+}
+.md-btn--danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--md-on-error) var(--md-state-hover-pct), var(--md-error));
+}
+.md-btn--danger:active:not(:disabled) {
+  background: color-mix(in srgb, var(--md-on-error) var(--md-state-pressed-pct), var(--md-error));
 }
 
 /* FAB */
@@ -339,6 +612,7 @@ textarea {
   background: var(--md-primary-container);
   color: var(--md-on-primary-container);
   font: var(--md-label-large);
+  letter-spacing: var(--md-ls-label-large);
   cursor: pointer;
   box-shadow: var(--md-elevation-3);
   transition:
@@ -359,7 +633,9 @@ textarea {
   box-shadow: var(--md-elevation-2);
 }
 
-/* Icon button */
+/* Icon button.
+   The visual circle stays 40dp (MD3 spec); the hit area is grown to the 48dp
+   minimum with a pseudo-element so the app bar does not get visually sparse. */
 .md-icon-btn {
   position: relative;
   display: inline-grid;
@@ -371,16 +647,31 @@ textarea {
   background: transparent;
   color: var(--md-on-surface-variant);
   cursor: pointer;
-  overflow: hidden;
+  overflow: visible;
   transition: background var(--md-dur-short3) var(--md-ease-standard);
   flex: 0 0 auto;
-  font-size: 18px;
+  font-size: var(--md-icon-size-sm);
+}
+.md-icon-btn::before {
+  content: "";
+  position: absolute;
+  inset: -4px; /* 40 + 8 = 48dp hit target */
+  border-radius: var(--md-shape-full);
 }
 .md-icon-btn:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--md-on-surface) 8%, transparent);
+  background: color-mix(in srgb, var(--md-on-surface) var(--md-state-hover-pct), transparent);
+}
+.md-icon-btn:active:not(:disabled) {
+  background: color-mix(in srgb, var(--md-on-surface) var(--md-state-pressed-pct), transparent);
+}
+.md-icon-btn:focus-visible {
+  /* The default outline hugs the 40dp box; keep it there — the ::before is a
+     pointer-only hit target and must not visually enlarge the ring. */
+  outline: 3px solid var(--md-primary);
+  outline-offset: 2px;
 }
 .md-icon-btn:disabled {
-  opacity: 0.38;
+  opacity: var(--md-state-disabled);
   cursor: default;
 }
 .md-icon-btn.toggled {
@@ -401,6 +692,7 @@ textarea {
 
 .md-field__label {
   font: var(--md-body-small);
+  letter-spacing: var(--md-ls-body-small);
   color: var(--md-on-surface-variant);
   margin-bottom: 8px;
 }
@@ -414,6 +706,7 @@ textarea {
 .md-field input[type="password"],
 .md-field input[type="time"],
 .md-field input[type="datetime-local"],
+.md-field input[type="search"],
 .md-field select,
 .md-field textarea,
 .md-input {
@@ -425,6 +718,7 @@ textarea {
   border-radius: var(--md-shape-xs);
   color: var(--md-on-surface);
   font: var(--md-body-large);
+  letter-spacing: var(--md-ls-body-large);
   outline: 0;
   transition:
     border-color var(--md-dur-short3) var(--md-ease-standard),
@@ -436,7 +730,7 @@ textarea {
   min-height: 96px;
   padding: 16px;
   font-family: var(--md-font-mono);
-  font-size: 13px;
+  font-size: var(--md-mono-size);
   resize: vertical;
 }
 
@@ -459,12 +753,13 @@ textarea {
 .md-field select:disabled,
 .md-field textarea:disabled,
 .md-input:disabled {
-  opacity: 0.38;
+  opacity: var(--md-state-disabled);
   cursor: default;
 }
 
 .md-field__help {
   font: var(--md-body-small);
+  letter-spacing: var(--md-ls-body-small);
   color: var(--md-on-surface-variant);
   margin-top: 6px;
 }
@@ -493,17 +788,27 @@ textarea {
   display: flex;
   align-items: center;
   gap: 12px;
-  height: 48px;
+  height: var(--md-touch-min);
   padding: 0 16px;
   background: var(--md-surface-container-high);
   border-radius: var(--md-shape-full);
-  min-width: 240px;
-  transition: background var(--md-dur-short3) var(--md-ease-standard);
+  min-width: var(--md-search-min-width);
+  transition:
+    background var(--md-dur-short3) var(--md-ease-standard),
+    outline-color var(--md-dur-short3) var(--md-ease-standard);
 }
+
+/* The old rule set `outline: 0` on the input, which killed the only visible
+   focus cue (the background step was 1.17:1). The ring now lives on the
+   container: primary is 11.1:1 against this container in dark and 5.3:1 in
+   light, both far above the 3:1 non-text threshold. */
 .md-search:focus-within {
   background: var(--md-surface-container-highest);
   box-shadow: var(--md-elevation-1);
+  outline: 3px solid var(--md-primary);
+  outline-offset: 2px;
 }
+
 .md-search input {
   flex: 1;
   min-width: 0;
@@ -511,6 +816,7 @@ textarea {
   background: transparent;
   outline: 0;
   font: var(--md-body-medium);
+  letter-spacing: var(--md-ls-body-medium);
   color: var(--md-on-surface);
 }
 .md-search input::placeholder {
@@ -525,10 +831,12 @@ textarea {
   display: flex;
   align-items: flex-start;
   gap: 12px;
+  min-height: var(--md-touch-min);
   padding: 8px 0;
   cursor: pointer;
   color: var(--md-on-surface);
   font: var(--md-body-medium);
+  letter-spacing: var(--md-ls-body-medium);
   border-radius: var(--md-shape-xs);
 }
 .md-check:hover .md-check__box {
@@ -544,9 +852,9 @@ textarea {
   flex: 0 0 auto;
   width: 18px;
   height: 18px;
-  margin-top: 1px;
+  margin-top: 3px;
   border: 2px solid var(--md-on-surface-variant);
-  border-radius: 2px;
+  border-radius: var(--md-shape-checkbox);
   display: grid;
   place-items: center;
   transition:
@@ -574,11 +882,15 @@ textarea {
   outline: 3px solid var(--md-primary);
   outline-offset: 2px;
 }
+.md-check input:focus-visible ~ .md-check__text {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
 .md-check input:disabled + .md-check__box {
-  opacity: 0.38;
+  opacity: var(--md-state-disabled);
 }
 .md-check input:disabled ~ .md-check__text {
-  opacity: 0.38;
+  opacity: var(--md-state-disabled);
 }
 .md-check__text {
   flex: 1;
@@ -589,6 +901,7 @@ textarea {
   display: block;
   color: var(--md-on-surface-variant);
   font: var(--md-body-small);
+  letter-spacing: var(--md-ls-body-small);
   margin-top: 2px;
 }
 
@@ -602,7 +915,9 @@ textarea {
   gap: 8px;
 }
 
+/* Visual height stays 32dp (MD3 chip); the hit area is 48dp via ::before. */
 .md-chip {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -613,19 +928,35 @@ textarea {
   background: transparent;
   color: var(--md-on-surface-variant);
   font: var(--md-label-large);
+  letter-spacing: var(--md-ls-label-large);
   cursor: pointer;
   white-space: nowrap;
   transition:
     background var(--md-dur-short3) var(--md-ease-standard),
     border-color var(--md-dur-short3) var(--md-ease-standard);
 }
+.md-chip::before {
+  content: "";
+  position: absolute;
+  inset: -8px -4px; /* 32 + 16 = 48dp hit target */
+  border-radius: var(--md-shape-sm);
+}
 .md-chip:hover {
-  background: color-mix(in srgb, var(--md-on-surface) 8%, transparent);
+  background: color-mix(in srgb, var(--md-on-surface) var(--md-state-hover-pct), transparent);
+}
+.md-chip:active {
+  background: color-mix(in srgb, var(--md-on-surface) var(--md-state-pressed-pct), transparent);
 }
 .md-chip.selected {
   background: var(--md-secondary-container);
   color: var(--md-on-secondary-container);
   border-color: transparent;
+}
+.md-chip.selected:hover {
+  background: color-mix(in srgb, var(--md-on-secondary-container) var(--md-state-hover-pct), var(--md-secondary-container));
+}
+.md-chip.selected:active {
+  background: color-mix(in srgb, var(--md-on-secondary-container) var(--md-state-pressed-pct), var(--md-secondary-container));
 }
 .md-chip__check {
   font-size: 14px;
@@ -636,10 +967,11 @@ textarea {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  height: 24px;
+  height: var(--md-badge-height);
   padding: 0 10px;
   border-radius: var(--md-shape-sm);
   font: var(--md-label-medium);
+  letter-spacing: var(--md-ls-label-medium);
   white-space: nowrap;
   background: var(--md-surface-container-high);
   color: var(--md-on-surface-variant);
@@ -673,13 +1005,14 @@ textarea {
 .md-queue-marker {
   display: inline-grid;
   place-items: center;
-  min-width: 20px;
+  min-width: var(--md-queue-marker-min-width);
   height: 20px;
   padding: 0 5px;
   border-radius: var(--md-shape-xs);
   background: var(--md-surface-container-highest);
   color: var(--md-on-surface-variant);
   font: var(--md-label-small);
+  letter-spacing: var(--md-ls-label-small);
   font-family: var(--md-font-mono);
 }
 
@@ -728,6 +1061,7 @@ textarea {
 }
 .md-segment__index {
   font: var(--md-label-medium);
+  letter-spacing: var(--md-ls-label-medium);
   font-family: var(--md-font-mono);
   color: var(--md-on-surface-variant);
   text-align: right;
@@ -746,6 +1080,7 @@ textarea {
 }
 .md-segment__value {
   font: var(--md-label-medium);
+  letter-spacing: var(--md-ls-label-medium);
   font-family: var(--md-font-mono);
   color: var(--md-on-surface-variant);
   text-align: right;
@@ -769,6 +1104,9 @@ textarea {
   table-layout: fixed;
 }
 
+/* Sortable header cells are keyboard targets: tabindex=0 + role=columnheader
+   + aria-sort. They get the 48dp floor so the pointer target is comfortable
+   and the focus ring has room. */
 .md-table thead th {
   position: sticky;
   top: 0;
@@ -776,17 +1114,24 @@ textarea {
   background: var(--md-surface-container);
   color: var(--md-on-surface-variant);
   font: var(--md-label-large);
+  letter-spacing: var(--md-ls-label-large);
   text-align: left;
+  height: var(--md-table-row-height);
   padding: 14px 12px;
   white-space: nowrap;
   cursor: pointer;
   user-select: none;
-  border-bottom: 1px solid var(--md-outline-variant);
-  transition: background var(--md-dur-short3) var(--md-ease-standard);
+  border-bottom: 1px solid var(--md-outline-strong);
+  transition:
+    background var(--md-dur-short3) var(--md-ease-standard),
+    color var(--md-dur-short3) var(--md-ease-standard);
 }
 .md-table thead th:hover {
   background: var(--md-surface-container-high);
   color: var(--md-on-surface);
+}
+.md-table thead th:active {
+  background: var(--md-surface-container-highest);
 }
 .md-table thead th.static {
   cursor: default;
@@ -797,32 +1142,82 @@ textarea {
 }
 .md-table thead th .sort-arrow {
   margin-left: 6px;
-  font-size: 10px;
+  font-size: 12px;
   color: var(--md-primary);
 }
 
 .md-table tbody td {
   padding: 12px;
-  border-bottom: 1px solid var(--md-outline-variant);
+  border-bottom: 1px solid var(--md-outline-strong);
   font: var(--md-body-medium);
+  letter-spacing: var(--md-ls-body-medium);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   vertical-align: middle;
+  /* Solid fill so the sticky header cannot bleed through a translucent
+     hover layer. */
+  background: var(--md-surface);
 }
 
 .md-table tbody tr {
+  height: var(--md-table-row-height);
+  cursor: default;
   transition: background var(--md-dur-short2) var(--md-ease-standard);
 }
 .md-table tbody tr:hover td {
-  background: color-mix(in srgb, var(--md-on-surface) 5%, transparent);
+  background: color-mix(in srgb, var(--md-on-surface) var(--md-state-hover-pct), var(--md-surface));
+}
+.md-table tbody tr:active td {
+  background: color-mix(in srgb, var(--md-on-surface) var(--md-state-pressed-pct), var(--md-surface));
 }
 .md-table tbody tr.selected td {
   background: var(--md-secondary-container);
   color: var(--md-on-secondary-container);
 }
 .md-table tbody tr.selected:hover td {
-  background: color-mix(in srgb, var(--md-on-secondary-container) 12%, var(--md-secondary-container));
+  background: color-mix(in srgb, var(--md-on-secondary-container) var(--md-state-hover-pct), var(--md-secondary-container));
+}
+.md-table tbody tr.selected:active td {
+  background: color-mix(in srgb, var(--md-on-secondary-container) var(--md-state-pressed-pct), var(--md-secondary-container));
+}
+
+/* Rows are focusable (keyboard selection). `outline` on a <tr> is painted
+   under the cell backgrounds in `border-collapse: separate`, so the ring is
+   drawn as an inset box-shadow on every cell instead. */
+.md-table tbody tr:focus-visible {
+  outline: none;
+}
+.md-table tbody tr:focus-visible td {
+  background: var(--md-secondary-container);
+  color: var(--md-on-secondary-container);
+  box-shadow:
+    inset 0 2px 0 0 var(--md-primary),
+    inset 0 -2px 0 0 var(--md-primary);
+}
+.md-table tbody tr:focus-visible td:first-child {
+  box-shadow:
+    inset 2px 0 0 0 var(--md-primary),
+    inset 0 2px 0 0 var(--md-primary),
+    inset 0 -2px 0 0 var(--md-primary);
+}
+.md-table tbody tr:focus-visible td:last-child {
+  box-shadow:
+    inset -2px 0 0 0 var(--md-primary),
+    inset 0 2px 0 0 var(--md-primary),
+    inset 0 -2px 0 0 var(--md-primary);
+}
+
+/* Keyboard focus for the sticky sortable header. */
+.md-table thead th:focus-visible {
+  outline: none;
+  box-shadow:
+    inset 0 2px 0 0 var(--md-primary),
+    inset 0 -2px 0 0 var(--md-primary),
+    inset 2px 0 0 0 var(--md-primary),
+    inset -2px 0 0 0 var(--md-primary);
+  background: var(--md-surface-container-high);
+  color: var(--md-on-surface);
 }
 
 .md-table td.numeric {
@@ -840,22 +1235,35 @@ textarea {
   min-width: 0;
 }
 .md-file-cell__glyph {
-  flex: 0 0 28px;
-  width: 28px;
-  height: 28px;
-  border-radius: var(--md-shape-sm);
+  flex: 0 0 var(--md-glyph-size);
+  width: var(--md-glyph-size);
+  height: var(--md-glyph-size);
+  border-radius: var(--md-shape-xs);
   display: grid;
   place-items: center;
   font: var(--md-label-small);
+  letter-spacing: var(--md-ls-label-small);
   font-weight: 700;
-  color: #fff;
-  letter-spacing: 0.02em;
+  /* Colour comes from the file-type token pair applied inline; `inherit`
+     would drop it, so the fg token is the default. */
+  color: var(--md-file-default-fg);
+  background: var(--md-file-default-bg);
 }
 .md-file-cell__name {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Progress meta under the bar: 11px via the label-small step instead of an
+   inline `fontSize`. */
+.md-progress-meta {
+  font: var(--md-label-small);
+  letter-spacing: var(--md-ls-label-small);
+  color: var(--md-on-surface-variant);
+  margin-top: 4px;
+  font-variant-numeric: tabular-nums;
 }
 
 /* ============================================================================
@@ -880,10 +1288,12 @@ textarea {
 }
 .md-empty__title {
   font: var(--md-title-medium);
+  letter-spacing: var(--md-ls-title-medium);
   color: var(--md-on-surface);
 }
 .md-empty__body {
   font: var(--md-body-medium);
+  letter-spacing: var(--md-ls-body-medium);
   max-width: 420px;
   line-height: 1.6;
 }
@@ -897,7 +1307,7 @@ textarea {
   inset: 0;
   /* Alpha belongs to the backdrop colour, never to the container: an
      `opacity` on the container would also fade the dialog it holds. */
-  background: rgba(0, 0, 0, 0.6);
+  background: color-mix(in srgb, var(--md-scrim) var(--md-scrim-opacity), transparent);
   display: grid;
   place-items: center;
   z-index: 60;
@@ -905,8 +1315,8 @@ textarea {
   padding: 24px;
 }
 @keyframes md-fade {
-  from { background: rgba(0, 0, 0, 0); }
-  to { background: rgba(0, 0, 0, 0.6); }
+  from { background: color-mix(in srgb, var(--md-scrim) 0%, transparent); }
+  to { background: color-mix(in srgb, var(--md-scrim) var(--md-scrim-opacity), transparent); }
 }
 
 .md-dialog {
@@ -917,7 +1327,7 @@ textarea {
   display: flex;
   flex-direction: column;
   width: min(640px, 100%);
-  max-height: calc(100vh - 64px);
+  max-height: var(--md-dialog-max-height);
   opacity: 1;
   animation: md-dialog-in var(--md-dur-medium1) var(--md-ease-emphasized);
 }
@@ -933,14 +1343,24 @@ textarea {
   display: flex;
   align-items: flex-start;
   gap: 12px;
+  flex: 0 0 auto;
 }
 .md-dialog__headline {
   font: var(--md-headline-small);
+  letter-spacing: var(--md-ls-headline-small);
   flex: 1;
   min-width: 0;
+  /* Programmatic focus target when the dialog has no form control. */
+  outline: 0;
+}
+.md-dialog__headline:focus-visible {
+  outline: 3px solid var(--md-primary);
+  outline-offset: 4px;
+  border-radius: var(--md-shape-xs);
 }
 .md-dialog__subhead {
   font: var(--md-body-medium);
+  letter-spacing: var(--md-ls-body-medium);
   color: var(--md-on-surface-variant);
   margin-top: 4px;
 }
@@ -957,12 +1377,14 @@ textarea {
   gap: 8px;
   padding: 16px 24px 24px;
   flex-wrap: wrap;
+  flex: 0 0 auto;
 }
 .md-dialog__actions .spacer {
   margin-right: auto;
 }
 .md-dialog__note {
   font: var(--md-body-small);
+  letter-spacing: var(--md-ls-body-small);
   color: var(--md-on-surface-variant);
 }
 
@@ -981,18 +1403,25 @@ textarea {
 
 .md-tab {
   position: relative;
+  min-height: var(--md-touch-min);
   padding: 14px 20px;
   border: 0;
   background: transparent;
   color: var(--md-on-surface-variant);
   font: var(--md-title-small);
+  letter-spacing: var(--md-ls-title-small);
   cursor: pointer;
   white-space: nowrap;
-  transition: color var(--md-dur-short3) var(--md-ease-standard);
+  transition:
+    color var(--md-dur-short3) var(--md-ease-standard),
+    background var(--md-dur-short3) var(--md-ease-standard);
 }
 .md-tab:hover {
   color: var(--md-on-surface);
-  background: color-mix(in srgb, var(--md-on-surface) 5%, transparent);
+  background: color-mix(in srgb, var(--md-on-surface) var(--md-state-hover-pct), transparent);
+}
+.md-tab:active {
+  background: color-mix(in srgb, var(--md-on-surface) var(--md-state-pressed-pct), transparent);
 }
 .md-tab[aria-selected="true"] {
   color: var(--md-primary);
@@ -1022,16 +1451,21 @@ textarea {
   display: flex;
   align-items: center;
   gap: 12px;
+  min-height: var(--md-touch-min);
   padding: 12px 16px;
-  border-bottom: 1px solid var(--md-outline-variant);
+  border-bottom: 1px solid var(--md-outline-strong);
   font: var(--md-body-medium);
+  letter-spacing: var(--md-ls-body-medium);
   transition: background var(--md-dur-short2) var(--md-ease-standard);
 }
 .md-list-item:last-child {
   border-bottom: 0;
 }
 .md-list-item:hover {
-  background: color-mix(in srgb, var(--md-on-surface) 5%, transparent);
+  background: color-mix(in srgb, var(--md-on-surface) var(--md-state-hover-pct), transparent);
+}
+.md-list-item:active {
+  background: color-mix(in srgb, var(--md-on-surface) var(--md-state-pressed-pct), transparent);
 }
 .md-list-item .grow {
   flex: 1;
@@ -1069,6 +1503,7 @@ textarea {
   background: var(--md-inverse-surface);
   color: var(--md-inverse-on-surface);
   font: var(--md-body-medium);
+  letter-spacing: var(--md-ls-body-medium);
   box-shadow: var(--md-elevation-3);
   pointer-events: auto;
   animation: md-snackbar-in var(--md-dur-medium1) var(--md-ease-emphasized);
@@ -1087,13 +1522,18 @@ textarea {
   background: transparent;
   color: var(--md-inverse-primary);
   font: var(--md-label-large);
+  letter-spacing: var(--md-ls-label-large);
   cursor: pointer;
+  min-height: 36px;
   padding: 6px 10px;
   border-radius: var(--md-shape-xs);
   flex: 0 0 auto;
 }
 .md-snackbar__action:hover {
-  background: color-mix(in srgb, var(--md-inverse-primary) 12%, transparent);
+  background: color-mix(in srgb, var(--md-inverse-primary) var(--md-state-hover-pct), transparent);
+}
+.md-snackbar__action:active {
+  background: color-mix(in srgb, var(--md-inverse-primary) var(--md-state-pressed-pct), transparent);
 }
 .md-snackbar--error {
   background: var(--md-error-container);
@@ -1119,6 +1559,7 @@ textarea {
 
 .md-section-title {
   font: var(--md-title-small);
+  letter-spacing: var(--md-ls-title-small);
   color: var(--md-primary);
   margin: 24px 0 12px;
   padding-bottom: 8px;
@@ -1128,6 +1569,7 @@ textarea {
 
 .md-supporting {
   font: var(--md-body-small);
+  letter-spacing: var(--md-ls-body-small);
   color: var(--md-on-surface-variant);
   line-height: 1.6;
 }
@@ -1150,15 +1592,26 @@ textarea {
   gap: 8px;
 }
 
+/* Shared inline layout, replacing the same inline style repeated across six
+   dialogs. */
+.md-inline {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.md-inline.tight { gap: 8px; }
+
 .md-kv {
   display: grid;
   grid-template-columns: 132px 1fr;
   gap: 10px 16px;
   font: var(--md-body-medium);
+  letter-spacing: var(--md-ls-body-medium);
 }
 .md-kv dt {
   color: var(--md-on-surface-variant);
   font: var(--md-body-small);
+  letter-spacing: var(--md-ls-body-small);
   padding-top: 2px;
 }
 .md-kv dd {
@@ -1189,6 +1642,7 @@ textarea {
   background: var(--md-surface-container-high);
   color: var(--md-on-surface-variant);
   font: var(--md-label-large);
+  letter-spacing: var(--md-ls-label-large);
   font-variant-numeric: tabular-nums;
 }
 .md-speed.active {
@@ -1216,8 +1670,15 @@ textarea {
   display: grid;
   place-items: center;
   font: var(--md-title-large);
+  letter-spacing: var(--md-ls-title-large);
   font-weight: 700;
   flex: 0 0 auto;
+}
+
+/* Light theme: the brand gradient is the heaviest element on screen, so the
+   tint is muted to a primary-only pair. */
+[data-theme="light"] .md-brand {
+  background: linear-gradient(135deg, var(--md-primary) 0%, var(--md-primary-fixed-dim) 100%);
 }
 
 /* Grabber step indicator */
@@ -1230,12 +1691,14 @@ textarea {
 .md-step {
   flex: 1;
   min-width: 120px;
+  min-height: var(--md-touch-min);
   padding: 10px 12px;
   border-radius: var(--md-shape-sm);
   border: 1px solid var(--md-outline-variant);
   background: transparent;
   color: var(--md-on-surface-variant);
   font: var(--md-label-medium);
+  letter-spacing: var(--md-ls-label-medium);
   cursor: pointer;
   text-align: left;
   transition:
@@ -1243,7 +1706,10 @@ textarea {
     color var(--md-dur-short3) var(--md-ease-standard);
 }
 .md-step:hover {
-  background: color-mix(in srgb, var(--md-on-surface) 8%, transparent);
+  background: color-mix(in srgb, var(--md-on-surface) var(--md-state-hover-pct), transparent);
+}
+.md-step:active {
+  background: color-mix(in srgb, var(--md-on-surface) var(--md-state-pressed-pct), transparent);
 }
 .md-step.active {
   background: var(--md-primary);
@@ -1258,5 +1724,130 @@ textarea {
 /* Inline error text */
 .md-error-text {
   font: var(--md-body-small);
+  letter-spacing: var(--md-ls-body-small);
   color: var(--md-error);
+}
+
+/* ============================================================================
+   Long-list scrolling
+
+   `content-visibility: auto` lets the browser skip layout and paint for rows
+   that are far outside the viewport, which keeps thousands of queued tasks
+   from costing a full layout pass per snapshot. `contain-intrinsic-size` keeps
+   the scrollbar honest while rows are skipped.
+   ============================================================================ */
+
+.md-table tbody tr {
+  content-visibility: auto;
+  contain-intrinsic-size: auto var(--md-table-row-height);
+}
+
+/* ============================================================================
+   Responsive rules
+
+   The window can shrink to 900x520. Fixed columns used to total 828px against
+   810px of table width, which collapsed 文件名 (the most important column) to
+   0px. Secondary columns now fold away in priority order instead, and 文件名
+   keeps a floor because it is sized with `minmax()` in the colgroup.
+   ============================================================================ */
+
+/* Columns fold away by hiding the matching <col> as well as the cells.
+
+   `display: none` on a cell removes it from the row box, but the <colgroup>
+   keeps all eight <col> entries: with `table-layout: fixed` the widths are then
+   assigned by position, so every visible cell shifted one slot to the left and
+   inherited a *neighbour's* width. Measured at 900x520: 文件名 rendered 56px
+   (the 队列 width), 状态 200px (the 文件名 width), 进度 126px (the 描述 width),
+   and the table stayed 958px inside an 820px region — a 138px horizontal
+   scrollbar with no visible cause. Hiding the <col> too keeps the column count
+   and the cells in step, which removes the overflow as well. */
+@media (max-width: 1120px) {
+  /* 描述 is the first to go: it is free text and always secondary. */
+  .md-table colgroup col:nth-child(3),
+  .md-table thead th:nth-child(3),
+  .md-table tbody td:nth-child(3) {
+    display: none;
+  }
+  .md-table {
+    min-width: 720px;
+  }
+}
+
+@media (max-width: 980px) {
+  /* Then the two live-rate columns, which only matter for active downloads. */
+  .md-table colgroup col:nth-child(6),
+  .md-table colgroup col:nth-child(7),
+  .md-table thead th:nth-child(6),
+  .md-table tbody td:nth-child(6),
+  .md-table thead th:nth-child(7),
+  .md-table tbody td:nth-child(7) {
+    display: none;
+  }
+  .md-search {
+    min-width: 160px;
+  }
+  .md-top-app-bar {
+    padding: 0 8px;
+  }
+}
+
+@media (max-width: 940px) {
+  /* 队列 marker and 大小 fold last: the file name, status and progress remain. */
+  .md-table colgroup col:nth-child(1),
+  .md-table colgroup col:nth-child(5),
+  .md-table thead th:nth-child(1),
+  .md-table tbody td:nth-child(1),
+  .md-table thead th:nth-child(5),
+  .md-table tbody td:nth-child(5) {
+    display: none;
+  }
+}
+
+/* Short windows: shrink vertical chrome so the rail and dialogs still fit.
+   Below 640px tall the rail drops its text labels (the MD3 collapsed rail
+   pattern) and the dialog hugs the viewport edges. */
+@media (max-height: 640px) {
+  .md-nav-rail {
+    --md-rail-item-min-height: 48px;
+    --md-rail-padding: 8px;
+  }
+  .md-nav-rail__label {
+    display: none;
+  }
+  .md-dialog {
+    max-height: calc(100vh - 24px);
+  }
+  .md-dialog__header {
+    padding: 16px 16px 0;
+  }
+  .md-dialog__content {
+    padding: 12px 16px 4px;
+  }
+  .md-dialog__actions {
+    padding: 12px 16px 16px;
+  }
+  .md-rail-category-panel {
+    max-height: calc(100vh - 48px);
+  }
+}
+
+/* High-contrast / forced-colours: rely on the system ring, not our tint. */
+@media (forced-colors: active) {
+  :focus-visible {
+    outline: 3px solid Highlight;
+  }
+  .md-table tbody tr:focus-visible td {
+    outline: 2px solid Highlight;
+  }
+}
+
+/* Respect reduced-motion. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

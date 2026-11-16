@@ -3,18 +3,40 @@
  *
  * The IPC channel names and payloads are the contract consumed by the
  * renderer; each handler validates its input and never trusts the renderer.
+ *
+ * Trust model: the renderer is treated as attacker-reachable (it can be
+ * navigated, XSS'd or driven by a compromised extension). Therefore:
+ *   - every handler validates and narrows its arguments (see ./validate);
+ *   - handlers mutate only allow-listed fields;
+ *   - paths are confined to folders the user actually chose;
+ *   - the window cannot navigate away from its own bundled page.
  */
 
-import { app, BrowserWindow, Menu, Tray, clipboard, dialog, ipcMain, nativeImage, shell, Notification } from 'electron';
+import {
+  app,
+  BrowserWindow,
+  Menu,
+  Tray,
+  clipboard,
+  dialog,
+  ipcMain,
+  nativeImage,
+  safeStorage,
+  session,
+  shell,
+  Notification,
+} from 'electron';
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import type {
   AppSettings,
+  CategoryId,
   DownloadTask,
   GrabberProject,
   GrabberStats,
   IpcResult,
+  ProgressSnapshot,
   Queue,
   ScheduleEntry,
   TaskCreateInput,
@@ -23,8 +45,40 @@ import { expandBatch, suggestWidth, type BatchSpec } from './batch';
 import { fileNameFromUrl, probe } from './download-engine';
 import { relativeSavePath, startGrabber, type CrawlFoundFile, type GrabberHandle } from './grabber';
 import { startSniffer, type SniffedMedia, type SnifferHandle } from './media-sniffer';
-import { defaultSettings, LANGUAGES } from './settings';
+import {
+  CONNECTION_TYPE_IDS,
+  LANGUAGE_IDS,
+  decodeSettingsSecrets,
+  defaultSettings,
+  encodeSettingsSecrets,
+  mergeSettings,
+  sanitizeSchedules,
+  sanitizeVirusScan,
+} from './settings';
 import { TaskManager } from './task-manager';
+import {
+  FENXI_ENC_PREFIX,
+  asBoolean,
+  asEnum,
+  asInt,
+  asNumber,
+  asOptionalEnum,
+  asOptionalInt,
+  asOptionalString,
+  asString,
+  asStringOrNull,
+  assertExecutableProgram,
+  assertOutboundHostAllowed,
+  assertSafeFileName,
+  assertSafePath,
+  hardenFilePermissions,
+  isRecord,
+  isWithin,
+  parseHttpUrl,
+  sanitizeHeaderRecord,
+  type DirectoryPolicy,
+  type SecretCodec,
+} from './validate';
 
 // esbuild emits CommonJS for the main process, so __dirname is available.
 declare const __dirname: string;
@@ -36,27 +90,40 @@ declare const __dirname: string;
  * crash immediately for anyone running as root (containers, some VMs, and any
  * session started via `sudo`).
  *
- * The switch has to be appended before the app is ready, so it is applied here
- * at module scope. On a normal user account nothing changes: the sandbox stays
- * on, because this only triggers when the effective uid is 0.
+ * This is now an explicit opt-in instead of an automatic downgrade: the
+ * sandbox stays on unless the operator asks for the workaround, because
+ * disabling it removes the second line of defence behind every renderer bug.
+ * Set FENXI_ALLOW_NO_SANDBOX=1 to enable it (documented for containers).
  */
 function applyRootSandboxWorkaround(): void {
   const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
   if (!isRoot) return;
+  if (process.env.FENXI_ALLOW_NO_SANDBOX !== '1') {
+    console.error(
+      '[FenxiDL] Refusing to disable the Chromium sandbox automatically. ' +
+        'Running as root requires --no-sandbox; set FENXI_ALLOW_NO_SANDBOX=1 ' +
+        '(or pass --no-sandbox) only inside a disposable container.',
+    );
+    return;
+  }
   if (app.commandLine.hasSwitch('no-sandbox')) return;
   app.commandLine.appendSwitch('no-sandbox');
-  // Also disable the GPU sandbox; it is separate and fails the same way.
   if (!app.commandLine.hasSwitch('disable-gpu-sandbox')) {
     app.commandLine.appendSwitch('disable-gpu-sandbox');
   }
   console.warn(
-    '[FenxiDL] Running as root: the Chromium sandbox is disabled. ' +
+    '[FenxiDL] FENXI_ALLOW_NO_SANDBOX=1: the Chromium sandbox is disabled. ' +
       'For best security, run the app as a regular user.',
   );
 }
 
 applyRootSandboxWorkaround();
 
+/** The one page the window is allowed to display (plus the dev server). */
+const DEV_ORIGINS = (process.env.FENXI_DEV_ORIGIN ?? '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
@@ -68,6 +135,8 @@ let grabberHandle: GrabberHandle | null = null;
 let sniffer: SnifferHandle | null = null;
 const sniffedMedia: SniffedMedia[] = [];
 const SNIFFER_PORT = 47823;
+/** Set when the queues/schedules file existed but could not be parsed. */
+let auxLoadError: string | null = null;
 let grabberProject: GrabberProject | null = null;
 let grabberStats: GrabberStats = {
   status: 'idle',
@@ -79,6 +148,10 @@ let grabberStats: GrabberStats = {
 let grabberFiles: CrawlFoundFile[] = [];
 let clipboardTimer: NodeJS.Timeout | null = null;
 let lastClipboardText = '';
+/** Folders the user picked in a native folder dialog during this session. */
+const userChosenDirectories = new Set<string>();
+/** Set when OS encryption is unavailable, so the UI/log can warn once. */
+let plaintextSecretWarning = false;
 
 function userDataDir(): string {
   return app.getPath('userData');
@@ -92,44 +165,138 @@ function settingsPath(): string {
   return path.join(userDataDir(), 'settings.json');
 }
 
+function auxPath(): string {
+  return path.join(userDataDir(), 'aux.json');
+}
+
 function grabberProjectsPath(): string {
   return path.join(userDataDir(), 'grabber-projects.json');
 }
 
-async function loadSettings(): Promise<AppSettings> {
+// ------------------------------------------------------------------ secrets
+
+/**
+ * safeStorage-backed codec.
+ *
+ * Electron only exposes OS keyring encryption after the app is ready, so the
+ * codec is resolved lazily and cached. When encryption is unavailable the
+ * value is stored as-is and a one-time warning is surfaced; the app still
+ * works, but the log and UI state that secrets are not protected.
+ */
+let secretCodecResolved = false;
+let secretCodec: SecretCodec | null = null;
+
+function secretCodecOrNull(): SecretCodec | null {
+  if (secretCodecResolved) return secretCodec;
+  secretCodecResolved = true;
+  try {
+    if (!safeStorage.isEncryptionAvailable()) {
+      secretCodec = null;
+      return null;
+    }
+    secretCodec = {
+      protect: (plain: string) => `${FENXI_ENC_PREFIX}${safeStorage.encryptString(plain).toString('base64')}`,
+      unprotect: (stored: string) => {
+        const payload = stored.slice(FENXI_ENC_PREFIX.length);
+        return safeStorage.decryptString(Buffer.from(payload, 'base64'));
+      },
+    };
+  } catch {
+    secretCodec = null;
+  }
+  return secretCodec;
+}
+
+function warnPlaintextSecrets(reason: string): void {
+  if (plaintextSecretWarning) return;
+  plaintextSecretWarning = true;
+  const message =
+    'OS encryption is unavailable (' +
+    reason +
+    '): saved passwords are stored unencrypted on disk. ' +
+    'Install a keyring (gnome-keyring / kwallet / libsecret) to protect them.';
+  console.warn(`[FenxiDL] ${message}`);
+  broadcast('dl:log', message);
+}
+
+function broadcast(channel: string, payload: unknown): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send(channel, payload);
+  }
+}
+
+/** Write a JSON file atomically with owner-only permissions. */
+async function writePrivateJson(target: string, value: unknown): Promise<void> {
+  await fsp.mkdir(path.dirname(target), { recursive: true });
+  const tmp = `${target}.tmp`;
+  await fsp.writeFile(tmp, JSON.stringify(value, null, 2), { encoding: 'utf8', mode: 0o600 });
+  hardenFilePermissions(tmp, 0o600);
+  await fsp.rename(tmp, target);
+  hardenFilePermissions(target, 0o600);
+}
+
+// ----------------------------------------------------------------- settings
+
+function decodeStoredSettings(parsed: unknown): AppSettings {
   const base = defaultSettings();
+  if (!isRecord(parsed)) return base;
+  // Settings are read from disk (not from the renderer): keep unknown keys out
+  // but tolerate older files by merging only known, individually valid fields.
+  let merged: AppSettings;
+  try {
+    merged = mergeSettings(base, parsed, {});
+  } catch {
+    merged = base;
+  }
+  const codec = secretCodecOrNull();
+  if (!codec && JSON.stringify(parsed).includes(FENXI_ENC_PREFIX)) {
+    warnPlaintextSecrets('encrypted values found but no OS keyring is present');
+  }
+  return decodeSettingsSecrets(merged, codec, (m) => console.warn(`[FenxiDL] ${m}`));
+}
+
+async function loadSettings(): Promise<AppSettings> {
   try {
     const raw = await fsp.readFile(settingsPath(), 'utf8');
-    const parsed = JSON.parse(raw) as Partial<AppSettings>;
-    // Merge shallowly so new default fields appear after an update.
-    const merged: AppSettings = { ...base, ...parsed };
-    merged.categories = Array.isArray(parsed.categories) && parsed.categories.length
-      ? parsed.categories
-      : base.categories;
-    merged.credentials = Array.isArray(parsed.credentials) ? parsed.credentials : [];
-    merged.serverConnectionOverrides = parsed.serverConnectionOverrides ?? {};
+    const parsed = JSON.parse(raw) as unknown;
+    const merged = decodeStoredSettings(parsed);
+    // Older versions wrote 0644; tighten whatever is already there.
+    hardenFilePermissions(settingsPath(), 0o600);
     return merged;
   } catch {
-    return base;
+    return defaultSettings();
   }
 }
 
 async function saveSettings(next: AppSettings): Promise<void> {
-  await fsp.mkdir(userDataDir(), { recursive: true });
-  const tmp = `${settingsPath()}.tmp`;
-  await fsp.writeFile(tmp, JSON.stringify(next, null, 2), 'utf8');
-  await fsp.rename(tmp, settingsPath());
+  const codec = secretCodecOrNull();
+  if (!codec) warnPlaintextSecrets('no OS keyring available');
+  await writePrivateJson(settingsPath(), encodeSettingsSecrets(next, codec));
 }
 
 async function loadAux(): Promise<void> {
   try {
-    const raw = await fsp.readFile(path.join(userDataDir(), 'aux.json'), 'utf8');
+    const raw = await fsp.readFile(auxPath(), 'utf8');
     const data = JSON.parse(raw) as { queues?: Queue[]; schedules?: ScheduleEntry[] };
     queues = Array.isArray(data.queues) && data.queues.length ? data.queues : [];
     schedules = Array.isArray(data.schedules) ? data.schedules : [];
-  } catch {
+  } catch (err) {
     queues = [];
     schedules = [];
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT') {
+      // A corrupt file used to be discarded silently, and the next save then
+      // overwrote it — losing every queue and schedule with no trace. Keep a
+      // copy the user (or support) can recover from, and say so.
+      const backup = `${auxPath()}.corrupt-${Date.now()}`;
+      try {
+        await fsp.copyFile(auxPath(), backup);
+        console.error(`[FenxiDL] Readable backup of the damaged queues file: ${backup}`);
+      } catch {
+        console.error('[FenxiDL] The queues file is unreadable and could not be backed up.');
+      }
+      auxLoadError = err instanceof Error ? err.message : String(err);
+    }
   }
   if (queues.length === 0) {
     queues = [{ id: 'primary', name: 'Main download queue', concurrency: settings.defaultQueueConcurrency, isPrimary: true }];
@@ -140,23 +307,43 @@ async function loadAux(): Promise<void> {
 }
 
 async function saveAux(): Promise<void> {
-  await fsp.mkdir(userDataDir(), { recursive: true });
-  const tmp = path.join(userDataDir(), 'aux.json.tmp');
-  await fsp.writeFile(tmp, JSON.stringify({ queues, schedules }, null, 2), 'utf8');
-  await fsp.rename(tmp, path.join(userDataDir(), 'aux.json'));
+  await writePrivateJson(auxPath(), { queues, schedules });
 }
 
-function broadcast(channel: string, payload: unknown): void {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send(channel, payload);
-  }
+/** Placeholder the renderer sees in place of a stored password. */
+const SECRET_MASK = '\u0000stored';
+
+/** Replace a stored secret with the mask, keeping "is there one" observable. */
+function maskSecret(value: string | null): string | null {
+  if (value === null || value === '') return value === null ? null : '';
+  return SECRET_MASK;
+}
+
+/**
+ * Build the renderer-visible snapshot.
+ *
+ * Passwords are write-only across the bridge: the renderer learns that one is
+ * stored but never receives it, so an XSS or a remote page driving the bridge
+ * cannot exfiltrate saved site, per-task or proxy credentials.
+ */
+function redactSnapshot(): ProgressSnapshot {
+  const snap = requireManager().snapshot();
+  return {
+    ...snap,
+    settings: withheldCredentials(snap.settings),
+    tasks: snap.tasks.map(stripTaskSecrets),
+  };
+}
+
+function stripTaskSecrets(task: DownloadTask): DownloadTask {
+  return { ...task, password: maskSecret(task.password) };
 }
 
 function pushSnapshot(): void {
   if (!manager) return;
   queues = manager.getQueues();
   schedules = manager.getSchedules();
-  broadcast('dl:snapshot', manager.snapshot());
+  broadcast('dl:snapshot', redactSnapshot());
 }
 
 function ok<T>(value: T): IpcResult<T> {
@@ -186,60 +373,287 @@ function requireManager(): TaskManager {
   return manager;
 }
 
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
-}
-
-function asString(v: unknown, field: string, maxLen = 8192): string {
-  if (typeof v !== 'string') throw new Error(`${field} must be a string.`);
-  if (v.length > maxLen) throw new Error(`${field} is too long.`);
-  return v;
-}
-
-function asNumber(v: unknown, field: string): number {
-  if (typeof v !== 'number' || !Number.isFinite(v)) throw new Error(`${field} must be a number.`);
-  return v;
-}
-
 function validateUrl(raw: string): string {
-  const trimmed = raw.trim();
+  return parseHttpUrl(raw).toString();
+}
+
+// ------------------------------------------------------- directory allow-list
+
+/**
+ * Directories a task may write into.
+ *
+ * This is an allow-list rather than a deny-list so that new sensitive
+ * locations cannot silently become writable: the download roots, every
+ * configured category folder, the app's own folders, and any folder the user
+ * selected with the native folder picker during this session. Anything else —
+ * including /etc, ~/.ssh and autostart folders — is refused by
+ * `assertSafePath`, which also applies a hard deny-list.
+ */
+function directoryPolicy(): DirectoryPolicy {
+  const roots = new Set<string>();
+  const add = (p: string | undefined | null): void => {
+    if (typeof p !== 'string' || !p.trim()) return;
+    try {
+      roots.add(path.resolve(p));
+    } catch {
+      /* ignore unusable entries */
+    }
+  };
+  add(settings.defaultDirectory);
+  for (const category of settings.categories) add(category.directory);
+  for (const dir of [...userChosenDirectories]) add(dir);
+  try {
+    add(userDataDir());
+    add(app.getPath('downloads'));
+    add(app.getPath('temp'));
+  } catch {
+    /* app paths unavailable in some test harnesses */
+  }
+  // The batch and grabber dialogs accept a typed folder, so ordinary visible
+  // folders under the home directory stay writable; hidden folders, system
+  // paths and the deny-list entries above stay refused.
+  return { roots: [...roots], allowHomeSubtree: true };
+}
+
+/** Validate a download directory against the allow-list. */
+function assertAllowedDirectory(raw: unknown, field: string): string {
+  return assertSafePath(raw, field, directoryPolicy());
+}
+
+/** Validate a whole file path against the allow-list. */
+function assertAllowedFilePath(raw: unknown, field: string): string {
+  return assertSafePath(raw, field, directoryPolicy());
+}
+
+/**
+ * A task's own file may only be touched while it is still inside the folder
+ * the task declares, so a tampered `savePath` cannot reach other files.
+ */
+function assertTaskOwnFile(task: DownloadTask): string {
+  const resolved = assertAllowedFilePath(task.savePath, 'savePath');
+  const expected = path.resolve(task.directory);
+  if (!isWithin(expected, resolved)) {
+    throw new Error('The task file is outside its own download folder.');
+  }
+  if (path.basename(resolved) !== path.basename(task.savePath)) {
+    throw new Error('The task file path looks tampered with.');
+  }
+  return resolved;
+}
+
+// ------------------------------------------------------------ task patching
+
+/**
+ * Fields the renderer may change after creation.
+ *
+ * Everything else — savePath, url, status, downloadedBytes, segments,
+ * totalBytes, error, timestamps — stays under main-process control, so the
+ * renderer cannot redirect a write or forge completion state.
+ */
+function buildTaskPatch(patch: unknown, task: DownloadTask): Partial<DownloadTask> {
+  if (!isRecord(patch)) throw new Error('Invalid task patch.');
+  // Explicitly reject protected/unknown keys instead of silently dropping them:
+  // an attempt to write savePath or forge status is reported, not ignored.
+  const EDITABLE = new Set([
+    'openWhenDone', 'description', 'categoryId', 'connections', 'referer',
+    'username', 'password', 'headers', 'queueId', 'directory', 'fileName',
+  ]);
+  const rejected = Object.keys(patch).filter((key) => !EDITABLE.has(key));
+  if (rejected.length > 0) {
+    throw new Error(
+      `These fields cannot be changed from the window: ${rejected.join(', ')}. ` +
+        `Editable fields are: ${[...EDITABLE].join(', ')}.`,
+    );
+  }
+  const allowed: Partial<DownloadTask> = {};
+  if (patch.openWhenDone !== undefined) {
+    allowed.openWhenDone = asBoolean(patch.openWhenDone, 'openWhenDone');
+  }
+  if (patch.description !== undefined) {
+    allowed.description = asString(patch.description, 'description', 4000).trim();
+  }
+  if (patch.categoryId !== undefined) {
+    allowed.categoryId = asEnum(patch.categoryId, 'categoryId', [
+      'completed', 'programs', 'music', 'video', 'games', 'documents', 'archives', 'other',
+    ] as const);
+  }
+  if (patch.connections !== undefined) {
+    allowed.connections = asInt(patch.connections, 'connections', 1, 32);
+  }
+  if (patch.referer !== undefined) {
+    const referer = asStringOrNull(patch.referer, 'referer', 4096);
+    allowed.referer = referer ? parseHttpUrl(referer, 'referer').toString() : null;
+  }
+  if (patch.username !== undefined) {
+    allowed.username = asStringOrNull(patch.username, 'username', 256);
+  }
+  if (patch.password !== undefined) {
+    allowed.password = asStringOrNull(patch.password, 'password', 256);
+  }
+  if (patch.headers !== undefined) {
+    allowed.headers = sanitizeHeaderRecord(patch.headers, 'headers');
+  }
+  if (patch.queueId !== undefined) {
+    allowed.queueId = patch.queueId === null ? null : asString(patch.queueId, 'queueId', 64);
+  }
+  // Moving a task to another folder: the new save path is derived here from the
+  // validated folder plus the task's own file name. The renderer can never
+  // supply `savePath` directly, which is what closed the arbitrary-write bug.
+  if (patch.directory !== undefined) {
+    const directory = assertAllowedDirectory(patch.directory, 'directory');
+    const name = assertSafeFileName(
+      typeof patch.fileName === 'string' && patch.fileName.trim() ? patch.fileName : task.fileName,
+      'fileName',
+    );
+    allowed.directory = directory;
+    allowed.fileName = name;
+    allowed.savePath = path.join(directory, name);
+    // A finished file that is moved stays finished; an unfinished task keeps
+    // its accounting and is restarted from zero by the engine.
+    if (task.status === 'completed') allowed.finishedAt = task.finishedAt;
+  }
+  if (Object.keys(allowed).length === 0) {
+    throw new Error('The request did not contain any editable field.');
+  }
+  return allowed;
+}
+
+// --------------------------------------------------------------- navigation
+
+/** Is `url` the app's own bundled renderer page (or the dev server)? */
+function isInternalRendererUrl(raw: string): boolean {
   let u: URL;
   try {
-    u = new URL(trimmed);
+    u = new URL(raw);
   } catch {
-    throw new Error('Please enter a valid URL, including http:// or https://.');
+    return false;
   }
-  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-    throw new Error('Only http and https URLs are supported.');
+  if (u.protocol === 'file:') {
+    const rendererRoot = path.resolve(__dirname, '..', 'renderer');
+    let filePath: string;
+    try {
+      filePath = decodeURIComponent(u.pathname);
+    } catch {
+      return false;
+    }
+    if (process.platform === 'win32' && /^\/[A-Za-z]:/.test(filePath)) filePath = filePath.slice(1);
+    return isWithin(rendererRoot, path.resolve(filePath));
   }
-  return u.toString();
+  if (DEV_ORIGINS.length > 0) {
+    const origin = `${u.protocol}//${u.host}`;
+    return DEV_ORIGINS.includes(origin);
+  }
+  return false;
 }
+
+/** Open an external link safely: only http(s) leaves the app. */
+function openExternalSafely(raw: string): void {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return;
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
+  void shell.openExternal(u.toString());
+}
+
+/**
+ * Lock a webContents down: no navigation away from the bundled renderer, no
+ * new windows, no webview embedding, no unexpected permissions.
+ */
+function applyWebContentsPolicy(contents: Electron.WebContents): void {
+  const block = (raw: string, reason: string): void => {
+    console.warn(`[FenxiDL] Blocked ${reason}: ${raw}`);
+    if (/^https?:/i.test(raw)) openExternalSafely(raw);
+  };
+
+  // Electron 33 delivers these as a single `details` object where `url`
+  // lives on the event itself; the trailing `url` argument is deprecated.
+  contents.on('will-navigate', (details) => {
+    if (isInternalRendererUrl(details.url)) return;
+    details.preventDefault();
+    block(details.url, 'navigation away from the app page');
+  });
+
+  // Covers sub-frames and in-page navigations that `will-navigate` misses.
+  contents.on('will-frame-navigate', (details) => {
+    if (isInternalRendererUrl(details.url)) return;
+    details.preventDefault();
+    block(details.url, 'frame navigation away from the app page');
+  });
+
+  contents.on('will-redirect', (details) => {
+    if (isInternalRendererUrl(details.url)) return;
+    details.preventDefault();
+    block(details.url, 'redirect away from the app page');
+  });
+
+  contents.setWindowOpenHandler(({ url }) => {
+    openExternalSafely(url);
+    return { action: 'deny' };
+  });
+
+  contents.on('will-attach-webview', (event) => {
+    console.warn('[FenxiDL] Blocked a <webview> attachment.');
+    event.preventDefault();
+  });
+}
+
+/** Deny every renderer permission except the ones the UI actually needs. */
+function applyPermissionPolicy(targetSession: Electron.Session): void {
+  const ALLOWED = new Set(['clipboard-read', 'clipboard-sanitized-write', 'notifications', 'fullscreen']);
+  targetSession.setPermissionRequestHandler((_wc, permission, callback) => {
+    if (ALLOWED.has(permission)) {
+      callback(true);
+      return;
+    }
+    console.warn(`[FenxiDL] Denied a permission request: ${permission}`);
+    callback(false);
+  });
+  targetSession.setPermissionCheckHandler((_wc, permission) => ALLOWED.has(permission));
+  targetSession.setDisplayMediaRequestHandler((_request, callback) => {
+    // Screen capture is never needed by a download manager.
+    callback({});
+  });
+}
+
+// ---------------------------------------------------------------------- IPC
 
 function registerIpc(): void {
   // ------------------------------------------------------------- snapshots
-  handle('dl:snapshot', () => ok(requireManager().snapshot()));
+  handle('dl:snapshot', () => ok(redactSnapshot()));
 
   // ---------------------------------------------------------------- tasks
   handle('dl:createTask', (raw: unknown) => {
     if (!isRecord(raw)) throw new Error('Invalid task payload.');
+    const directory = raw.directory === undefined || raw.directory === null
+      ? undefined
+      : assertAllowedDirectory(raw.directory, 'directory');
     const input: TaskCreateInput = {
       url: validateUrl(asString(raw.url, 'url')),
-      fileName: typeof raw.fileName === 'string' ? asString(raw.fileName, 'fileName', 260) : undefined,
-      directory: typeof raw.directory === 'string' ? asString(raw.directory, 'directory', 1024) : undefined,
-      categoryId: typeof raw.categoryId === 'string' ? (raw.categoryId as TaskCreateInput['categoryId']) : undefined,
-      description: typeof raw.description === 'string' ? asString(raw.description, 'description', 4000) : undefined,
-      connections: typeof raw.connections === 'number' ? asNumber(raw.connections, 'connections') : undefined,
-      username: typeof raw.username === 'string' ? raw.username : null,
-      password: typeof raw.password === 'string' ? raw.password : null,
-      referer: typeof raw.referer === 'string' ? raw.referer : null,
-      headers: isRecord(raw.headers) ? (raw.headers as Record<string, string>) : {},
-      queueId: typeof raw.queueId === 'string' ? raw.queueId : null,
+      fileName: typeof raw.fileName === 'string' && raw.fileName.trim()
+        ? assertSafeFileName(raw.fileName, 'fileName')
+        : undefined,
+      directory,
+      categoryId: asOptionalEnum(raw.categoryId, 'categoryId', [
+        'completed', 'programs', 'music', 'video', 'games', 'documents', 'archives', 'other',
+      ] as const) as CategoryId | undefined,
+      description: asOptionalString(raw.description, 'description', 4000),
+      connections: asOptionalInt(raw.connections, 'connections', 1, 32),
+      username: asStringOrNull(raw.username, 'username', 256),
+      password: asStringOrNull(raw.password, 'password', 256),
+      referer: raw.referer === undefined || raw.referer === null
+        ? null
+        : parseHttpUrl(raw.referer, 'referer').toString(),
+      headers: sanitizeHeaderRecord(raw.headers, 'headers'),
+      queueId: asStringOrNull(raw.queueId, 'queueId', 64),
       addToQueueOnly: raw.addToQueueOnly === true,
       openWhenDone: raw.openWhenDone === true,
     };
     if (input.directory && settings.useLastPathForGeneral) {
       const rule = settings.categories.find((c) => c.id === 'completed');
-      if (rule) {
+      if (rule && previewAllowsDirectory(input.directory)) {
         // Persist the folder the user actually chose so the next general
         // download defaults there (spec string 1190).
         settings = {
@@ -263,7 +677,9 @@ function registerIpc(): void {
   handle('dl:setTaskOptions', (id: unknown, patch: unknown) => {
     if (!isRecord(patch)) throw new Error('Invalid options payload.');
     const allowed: Partial<DownloadTask> = {};
-    if (typeof patch.openWhenDone === 'boolean') allowed.openWhenDone = patch.openWhenDone;
+    if (patch.openWhenDone !== undefined) {
+      allowed.openWhenDone = asBoolean(patch.openWhenDone, 'openWhenDone');
+    }
     const updated = requireManager().updateTask(asString(id, 'id'), allowed);
     pushSnapshot();
     return ok(updated ?? null);
@@ -285,7 +701,20 @@ function registerIpc(): void {
     return ok(true);
   });
   handle('dl:removeTask', (id: unknown, deleteFile: unknown) => {
-    requireManager().removeTask(asString(id, 'id'), deleteFile === true);
+    const taskId = asString(id, 'id');
+    const removeFile = asBoolean(deleteFile === undefined ? false : deleteFile, 'deleteFile');
+    if (removeFile) {
+      const task = requireManager().getTask(taskId);
+      if (!task) throw new Error('The task no longer exists.');
+      // Only ever delete this task's own file, and only inside its own folder.
+      const safe = assertTaskOwnFile(task);
+      requireManager().removeTask(taskId, false);
+      void fsp.rm(safe, { force: true }).catch((err: unknown) => {
+        broadcast('dl:log', `Could not delete ${safe}: ${(err as Error).message}`);
+      });
+    } else {
+      requireManager().removeTask(taskId, false);
+    }
     pushSnapshot();
     return ok(true);
   });
@@ -300,17 +729,21 @@ function registerIpc(): void {
     return ok(true);
   });
   handle('dl:updateTask', (id: unknown, patch: unknown) => {
-    if (!isRecord(patch)) throw new Error('Invalid task patch.');
-    const updated = requireManager().updateTask(asString(id, 'id'), patch as Partial<DownloadTask>);
+    const taskId = asString(id, 'id');
+    const task = requireManager().getTask(taskId);
+    if (!task) throw new Error('The task no longer exists.');
+    const allowed = buildTaskPatch(patch, task);
+    const updated = requireManager().updateTask(taskId, allowed);
     pushSnapshot();
-    return ok(updated ?? null);
+    return ok(updated ? stripTaskSecrets(updated) : null);
   });
 
   handle('dl:openFile', async (id: unknown) => {
     const task = requireManager().getTask(asString(id, 'id'));
     if (!task) throw new Error('The task no longer exists.');
-    if (!fs.existsSync(task.savePath)) throw new Error('The downloaded file is no longer on disk.');
-    const err = await shell.openPath(task.savePath);
+    const target = assertTaskOwnFile(task);
+    if (!fs.existsSync(target)) throw new Error('The downloaded file is no longer on disk.');
+    const err = await shell.openPath(target);
     if (err) throw new Error(err);
     return ok(true);
   });
@@ -318,20 +751,26 @@ function registerIpc(): void {
   handle('dl:openFolder', async (id: unknown) => {
     const task = requireManager().getTask(asString(id, 'id'));
     if (!task) throw new Error('The task no longer exists.');
-    shell.showItemInFolder(task.savePath);
+    const target = assertTaskOwnFile(task);
+    shell.showItemInFolder(target);
     return ok(true);
   });
 
   // --------------------------------------------------------------- queues
   handle('dl:addQueue', (name: unknown, concurrency: unknown) => {
-    const q = requireManager().addQueue(asString(name, 'name', 120), asNumber(concurrency, 'concurrency'));
+    const q = requireManager().addQueue(asString(name, 'name', 120).trim(), asInt(concurrency, 'concurrency', 1, 50));
     void saveAux();
     pushSnapshot();
     return ok(q);
   });
   handle('dl:updateQueue', (id: unknown, patch: unknown) => {
     if (!isRecord(patch)) throw new Error('Invalid queue patch.');
-    requireManager().updateQueue(asString(id, 'id'), patch as Partial<Queue>);
+    const allowed: Partial<Queue> = {};
+    if (patch.name !== undefined) allowed.name = asString(patch.name, 'name', 120).trim();
+    if (patch.concurrency !== undefined) {
+      allowed.concurrency = asInt(patch.concurrency, 'concurrency', 1, 50);
+    }
+    requireManager().updateQueue(asString(id, 'id'), allowed);
     void saveAux();
     pushSnapshot();
     return ok(true);
@@ -360,25 +799,50 @@ function registerIpc(): void {
 
   // ------------------------------------------------------------ schedules
   handle('dl:setSchedules', (entries: unknown) => {
-    if (!Array.isArray(entries)) throw new Error('Schedules must be an array.');
-    requireManager().setSchedules(entries as ScheduleEntry[]);
+    const parsed = sanitizeSchedules(entries);
+    requireManager().setSchedules(parsed);
     void saveAux();
     pushSnapshot();
     return ok(true);
   });
 
   // ------------------------------------------------------------- settings
-  handle('dl:getSettings', () => ok(requireManager().getSettings()));
+  handle('dl:getSettings', () => ok(withheldCredentials(requireManager().getSettings())));
   handle('dl:saveSettings', async (next: unknown) => {
     if (!isRecord(next)) throw new Error('Invalid settings payload.');
-    const merged = { ...requireManager().getSettings(), ...(next as Partial<AppSettings>) } as AppSettings;
+    const current = requireManager().getSettings();
+    // Secrets are write-only for the renderer: an unchanged masked value must
+    // not overwrite the stored password with the mask.
+    const payload: Record<string, unknown> = { ...next };
+    if (payload.credentials !== undefined) {
+      payload.credentials = mergeWithheldCredentialPasswords(payload.credentials, current);
+    }
+    payload.httpProxy = mergeWithheldProxyPassword(payload.httpProxy, current.httpProxy);
+    payload.httpsProxy = mergeWithheldProxyPassword(payload.httpsProxy, current.httpsProxy);
+    payload.ftpProxy = mergeWithheldProxyPassword(payload.ftpProxy, current.ftpProxy);
+
+    const merged = mergeSettings(current, payload, {
+      validateProgram: (program) => assertExecutableProgram(program, 'virusScan.program'),
+      onSecurityChange: (message) => broadcast('dl:log', message),
+    });
+    // Directory fields must point somewhere the user could actually download to.
+    assertAllowedDirectory(merged.defaultDirectory, 'defaultDirectory');
+    for (const category of merged.categories) {
+      try {
+        assertAllowedDirectory(category.directory, `categories.${category.id}.directory`);
+      } catch {
+        // A category pointing outside the allow-list falls back to the default
+        // root rather than failing the whole save.
+        category.directory = merged.defaultDirectory;
+      }
+    }
     settings = merged;
     requireManager().applySettings(merged);
     await saveSettings(merged);
     applyLaunchAtStartup(merged);
     restartClipboardMonitor();
     pushSnapshot();
-    return ok(merged);
+    return ok(withheldCredentials(merged));
   });
 
   // ------------------------------------------------------------ batch/new
@@ -386,46 +850,64 @@ function registerIpc(): void {
     if (!isRecord(spec)) throw new Error('Invalid batch payload.');
     const parsed: BatchSpec = {
       template: asString(spec.template, 'template'),
-      from: asNumber(spec.from, 'from'),
-      to: asNumber(spec.to, 'to'),
-      width: asNumber(spec.width, 'width'),
+      from: asInt(spec.from, 'from', -1e9, 1e9),
+      to: asInt(spec.to, 'to', -1e9, 1e9),
+      width: asInt(spec.width, 'width', 1, 10),
     };
     return ok(expandBatch(parsed));
   });
   handle('dl:suggestWidth', (to: unknown) => ok(suggestWidth(asNumber(to, 'to'))));
 
   handle('dl:probeUrl', async (url: unknown) => {
-    const target = validateUrl(asString(url, 'url'));
-    const info = await probe(target);
+    // A probe makes the main process issue a request, so it must not be able
+    // to bounce off the local machine or a metadata endpoint (SSRF).
+    const target = parseHttpUrl(url, 'url');
+    assertOutboundHostAllowed(target.toString(), { blockLoopback: true });
+    const info = await probe(target.toString());
     return ok(info);
   });
 
   // ----------------------------------------------------------- filesystem
   handle('dl:chooseDirectory', async (current: unknown) => {
-    const startDir = typeof current === 'string' && current ? current : settings.defaultDirectory;
+    const requested = typeof current === 'string' && current ? current : settings.defaultDirectory;
+    let startDir = settings.defaultDirectory;
+    try {
+      // A path outside the allow-list only makes a bad default; never trust it.
+      startDir = assertAllowedDirectory(requested, 'directory');
+    } catch {
+      startDir = settings.defaultDirectory;
+    }
     const result = await dialog.showOpenDialog(mainWindow!, {
       title: 'Choose a folder',
       defaultPath: startDir,
       properties: ['openDirectory', 'createDirectory'],
     });
     if (result.canceled || result.filePaths.length === 0) return ok(null);
-    return ok(result.filePaths[0]);
+    const chosen = path.resolve(result.filePaths[0]);
+    // A native picker is the user's consent: remember it for this session.
+    userChosenDirectories.add(chosen);
+    return ok(chosen);
   });
 
   handle('dl:checkPath', async (target: unknown) => {
-    const dir = asString(target, 'directory', 1024);
+    // Read-only probe: creating arbitrary directories was the original bug.
+    let resolved: string;
     try {
-      await fsp.mkdir(dir, { recursive: true });
-      await fsp.access(dir, fs.constants.W_OK);
-      return ok({ writable: true, message: '' });
+      resolved = assertAllowedDirectory(target, 'directory');
     } catch (err) {
-      return ok({ writable: false, message: (err as Error).message });
+      return ok({ writable: false, message: (err as Error).message, allowed: false });
+    }
+    try {
+      await fsp.access(resolved, fs.constants.W_OK);
+      return ok({ writable: true, message: '', allowed: true });
+    } catch (err) {
+      return ok({ writable: false, message: (err as Error).message, allowed: true });
     }
   });
 
   // ------------------------------------------------------- import / export
   handle('dl:exportTasks', async (format: unknown) => {
-    const kind = asString(format, 'format');
+    const kind = asEnum(format, 'format', ['text', 'fdx'] as const);
     const tasks = requireManager().listTasks();
     if (kind === 'text') {
       const result = await dialog.showSaveDialog(mainWindow!, {
@@ -436,6 +918,7 @@ function registerIpc(): void {
       if (result.canceled || !result.filePath) return ok(null);
       const body = tasks.map((t) => t.url).join('\r\n');
       await fsp.writeFile(result.filePath, `${body}\r\n`, 'utf8');
+      hardenFilePermissions(result.filePath, 0o600);
       return ok(result.filePath);
     }
     const result = await dialog.showSaveDialog(mainWindow!, {
@@ -447,6 +930,7 @@ function registerIpc(): void {
     const payload = {
       version: 1,
       exportedAt: new Date().toISOString(),
+      // Credentials never leave the app through an export file.
       tasks: tasks.map((t) => ({
         url: t.url,
         fileName: t.fileName,
@@ -459,6 +943,7 @@ function registerIpc(): void {
       })),
     };
     await fsp.writeFile(result.filePath, JSON.stringify(payload, null, 2), 'utf8');
+    hardenFilePermissions(result.filePath, 0o600);
     return ok(result.filePath);
   });
 
@@ -488,27 +973,29 @@ function registerIpc(): void {
         .filter((l) => /^https?:\/\//i.test(l));
     }
     let imported = 0;
-    for (const url of urls) {
+    const skipped: string[] = [];
+    for (const url of urls.slice(0, 10_000)) {
       try {
-        const task = requireManager().createTask({ url, addToQueueOnly: true });
+        parseHttpUrl(url);
+        const task = requireManager().createTask({ url: validateUrl(url), addToQueueOnly: true });
         requireManager().start(task.id);
         imported += 1;
-      } catch {
-        /* skip invalid entries, count the rest */
+      } catch (err) {
+        skipped.push((err as Error).message);
       }
     }
+    if (skipped.length > 0) {
+      broadcast('dl:log', `Skipped ${skipped.length} imported entries: ${skipped[0]}`);
+    }
     pushSnapshot();
-    return ok({ imported });
+    return ok({ imported, skipped: skipped.length });
   });
 
   // --------------------------------------------------------------- grabber
   handle('dl:grabberStart', (project: unknown) => {
-    if (!isRecord(project)) throw new Error('Invalid grabber project.');
-    const parsed = project as unknown as GrabberProject;
-    if (!parsed.startUrl || !/^https?:\/\//i.test(parsed.startUrl)) {
-      throw new Error('The start page must be a valid http or https URL.');
-    }
+    const parsed = validateGrabberProject(project);
     if (grabberHandle) throw new Error('A grabber run is already in progress.');
+    assertOutboundHostAllowed(parsed.startUrl, { blockLoopback: true });
     grabberProject = parsed;
     grabberFiles = [];
     grabberStats = {
@@ -546,15 +1033,17 @@ function registerIpc(): void {
     if (!Array.isArray(urls)) throw new Error('Expected a list of URLs.');
     const project = grabberProject;
     let added = 0;
-    for (const raw of urls) {
+    for (const raw of urls.slice(0, 5000)) {
       if (typeof raw !== 'string') continue;
-      const match = grabberFiles.find((f) => f.absoluteUrl === raw);
       try {
+        const url = parseHttpUrl(raw).toString();
+        assertOutboundHostAllowed(url, { blockLoopback: true });
+        const match = grabberFiles.find((f) => f.absoluteUrl === raw);
         const target = project
           ? path.join(project.saveDirectory, relativeSavePath(project, match ?? {
-              url: raw,
-              absoluteUrl: raw,
-              fileName: fileNameFromUrl(raw),
+              url,
+              absoluteUrl: url,
+              fileName: fileNameFromUrl(url),
               extension: '',
               linkText: '',
               sourcePage: '',
@@ -562,17 +1051,19 @@ function registerIpc(): void {
               sizeBytes: null,
             }))
           : undefined;
+        const directory = target ? path.dirname(target) : project?.saveDirectory;
+        if (directory) assertAllowedDirectory(directory, 'directory');
         const task = requireManager().createTask({
-          url: raw,
-          directory: target ? path.dirname(target) : project?.saveDirectory,
-          fileName: target ? path.basename(target) : undefined,
+          url,
+          directory,
+          fileName: target ? assertSafeFileName(path.basename(target), 'fileName') : undefined,
           description: project?.useLinkTextAsDescription && match ? match.linkText : '',
           addToQueueOnly: !project?.downloadAllMatches,
         });
         if (project?.downloadAllMatches) requireManager().start(task.id);
         added += 1;
       } catch {
-        /* skip */
+        /* skip rejected entries, count the rest */
       }
     }
     grabberStats = { ...grabberStats, filesDownloaded: grabberStats.filesDownloaded + added };
@@ -582,13 +1073,13 @@ function registerIpc(): void {
   });
 
   handle('dl:grabberSaveProject', async (project: unknown) => {
-    if (!isRecord(project)) throw new Error('Invalid grabber project.');
+    const next = validateGrabberProject(project);
     const existing = await requireManager().loadGrabberProjects(grabberProjectsPath());
-    const next = project as unknown as GrabberProject;
     const idx = existing.findIndex((p) => p.id === next.id);
     if (idx >= 0) existing[idx] = next;
     else existing.push(next);
     await requireManager().saveGrabberProjects(existing, grabberProjectsPath());
+    hardenFilePermissions(grabberProjectsPath(), 0o600);
     return ok(true);
   });
 
@@ -598,9 +1089,10 @@ function registerIpc(): void {
   });
 
   handle('dl:grabberDeleteProject', async (id: unknown) => {
-    const target = asString(id, 'id');
+    const target = asString(id, 'id', 64);
     const existing = await requireManager().loadGrabberProjects(grabberProjectsPath());
     await requireManager().saveGrabberProjects(existing.filter((p) => p.id !== target), grabberProjectsPath());
+    hardenFilePermissions(grabberProjectsPath(), 0o600);
     return ok(true);
   });
 
@@ -612,6 +1104,10 @@ function registerIpc(): void {
       showCompleteDialog: settings.showCompleteDialog,
       showTipsOnStartup: settings.showTipsOnStartup,
       language: settings.language,
+      plaintextSecrets: secretCodecOrNull() === null,
+      // Surfaced so the UI can tell the user their queue list was reset
+      // instead of silently starting with no queues.
+      auxLoadError,
     }),
   );
   handle('dl:getSniffedMedia', () => ok(sniffedMedia.slice()));
@@ -623,11 +1119,107 @@ function registerIpc(): void {
     ok({ running: sniffer !== null, port: sniffer?.port ?? SNIFFER_PORT }),
   );
 
-  handle('dl:languages', () => ok(LANGUAGES));
+  handle('dl:languages', () => ok(LANGUAGE_IDS));
   handle('dl:revealLogs', async () => {
     await shell.openPath(userDataDir());
     return ok(true);
   });
+}
+
+/**
+ * Validate a grabber project payload.
+ *
+ * The project drives outbound requests and defines a save folder, so both the
+ * URL and the folder are checked, and every numeric knob is bounded.
+ */
+function validateGrabberProject(raw: unknown): GrabberProject {
+  if (!isRecord(raw)) throw new Error('Invalid grabber project.');
+  const startUrl = parseHttpUrl(raw.startUrl, 'startUrl').toString();
+  const saveDirectory = assertAllowedDirectory(raw.saveDirectory, 'saveDirectory');
+  const listOf = (v: unknown, field: string): string[] => {
+    if (!Array.isArray(v)) return [];
+    return v
+      .filter((x): x is string => typeof x === 'string')
+      .slice(0, 500)
+      .map((x) => asString(x, field, 200));
+  };
+  return {
+    id: asString(raw.id, 'id', 64),
+    name: asString(raw.name, 'name', 200),
+    startUrl,
+    saveDirectory,
+    onlyThisSite: raw.onlyThisSite === true,
+    wholeSite: raw.wholeSite === true,
+    maxDepth: asInt(raw.maxDepth, 'maxDepth', 0, 64),
+    otherSiteDepth: asInt(raw.otherSiteDepth, 'otherSiteDepth', 0, 64),
+    excludeParentDirs: raw.excludeParentDirs === true,
+    includeTypes: listOf(raw.includeTypes, 'includeTypes'),
+    excludeTypes: listOf(raw.excludeTypes, 'excludeTypes'),
+    includePaths: listOf(raw.includePaths, 'includePaths'),
+    excludePaths: listOf(raw.excludePaths, 'excludePaths'),
+    minBytes: asInt(raw.minBytes, 'minBytes', 0, Number.MAX_SAFE_INTEGER),
+    maxBytes: asInt(raw.maxBytes, 'maxBytes', 0, Number.MAX_SAFE_INTEGER),
+    concurrentExplore: asInt(raw.concurrentExplore, 'concurrentExplore', 1, 10),
+    concurrentDownload: asInt(raw.concurrentDownload, 'concurrentDownload', 1, 10),
+    addToQueueOnClose: raw.addToQueueOnClose === true,
+    useLinkTextAsDescription: raw.useLinkTextAsDescription === true,
+    useRelativePaths: raw.useRelativePaths === true,
+    convertLinksForOffline: raw.convertLinksForOffline === true,
+    overwriteExisting: raw.overwriteExisting === true,
+    downloadAllMatches: raw.downloadAllMatches === true,
+    filters: Array.isArray(raw.filters)
+      ? raw.filters.slice(0, 100).map((f) => {
+          const item = isRecord(f) ? f : {};
+          return {
+            id: asString(item.id, 'filters.id', 64),
+            name: asString(item.name, 'filters.name', 200),
+            kind: asEnum(item.kind, 'filters.kind', ['include', 'exclude'] as const),
+            patterns: listOf(item.patterns, 'filters.patterns'),
+          };
+        })
+      : [],
+    createdAt: typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt) ? raw.createdAt : Date.now(),
+  };
+}
+
+/** Strip stored passwords before handing settings to the renderer. */
+function withheldCredentials(next: AppSettings): AppSettings {
+  return {
+    ...next,
+    credentials: next.credentials.map((c) => ({ ...c, password: c.password ? SECRET_MASK : '' })),
+    httpProxy: { ...next.httpProxy, password: next.httpProxy.password ? SECRET_MASK : '' },
+    httpsProxy: { ...next.httpsProxy, password: next.httpsProxy.password ? SECRET_MASK : '' },
+    ftpProxy: { ...next.ftpProxy, password: next.ftpProxy.password ? SECRET_MASK : '' },
+  };
+}
+
+/** Restore masked passwords from the current settings before validating. */
+function mergeWithheldCredentialPasswords(raw: unknown, current: AppSettings) {
+  if (!Array.isArray(raw)) return raw;
+  const previous = new Map(current.credentials.map((c) => [`${c.site.toLowerCase()}|${c.username}`, c]));
+  return raw.map((item) => {
+    if (!isRecord(item)) return item;
+    if (item.password !== SECRET_MASK) return item;
+    const key = `${String(item.site ?? '').toLowerCase()}|${String(item.username ?? '')}`;
+    const match = previous.get(key);
+    return { ...item, password: match ? match.password : '' };
+  });
+}
+
+function mergeWithheldProxyPassword(raw: unknown, current: AppSettings['httpProxy']) {
+  if (!isRecord(raw)) return raw;
+  if (raw.password !== SECRET_MASK) return raw;
+  return { ...raw, password: current.password };
+}
+
+/** Would the directory policy accept this folder right now? */
+function previewAllowsDirectory(directory: string): boolean {
+  try {
+    assertAllowedDirectory(directory, 'directory');
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function applyLaunchAtStartup(enabled: AppSettings): void {
@@ -675,7 +1267,11 @@ function createWindow(): void {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      nodeIntegrationInWorker: false,
+      sandbox: true,
+      webviewTag: false,
+      allowRunningInsecureContent: false,
+      experimentalFeatures: false,
       spellcheck: false,
     },
   });
@@ -685,11 +1281,7 @@ function createWindow(): void {
     mainWindow = null;
   });
 
-  // External links always leave the app, never navigate the shell.
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (/^https?:/i.test(url)) void shell.openExternal(url);
-    return { action: 'deny' };
-  });
+  applyWebContentsPolicy(mainWindow.webContents);
 
   const indexPath = path.join(__dirname, '..', 'renderer', 'index.html');
   // Verify the renderer actually loads inside an asar archive; a silent
@@ -750,9 +1342,11 @@ async function bootstrap(): Promise<void> {
   });
   await manager.load();
 
+  applyPermissionPolicy(session.defaultSession);
+
   manager.on('changed', () => pushSnapshot());
   manager.on('progress', () => {
-    if (manager) broadcast('dl:snapshot', manager.snapshot());
+    if (manager) broadcast('dl:snapshot', redactSnapshot());
   });
   manager.on('log', (msg: string) => broadcast('dl:log', msg));
   manager.on('quotaExceeded', (msg: string) => {
@@ -805,13 +1399,27 @@ async function bootstrap(): Promise<void> {
   }
   manager.startBackgroundWork();
 
-  if (process.env.FENXI_SMOKE === '1') {
+  if (isSmokeEnabled()) {
     void runSmokeCheck();
   }
 }
 
 /**
- * Automated GUI smoke check, enabled only by FENXI_SMOKE=1.
+ * The GUI smoke check is a development/build tool, not a product feature: it
+ * refuses to run in a packaged build so no test-driving code path is reachable
+ * from the shipped application.
+ */
+function isSmokeEnabled(): boolean {
+  if (process.env.FENXI_SMOKE !== '1') return false;
+  if (app.isPackaged) {
+    console.warn('[FenxiDL] FENXI_SMOKE is ignored in packaged builds.');
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Automated GUI smoke check, enabled only by FENXI_SMOKE=1 in a dev build.
  *
  * It drives the real window (real IPC, real task manager) and writes the
  * rendered text plus a PNG so the build can be verified headlessly.
@@ -833,9 +1441,33 @@ async function runSmokeCheck(): Promise<void> {
 
     // Visible text plus accessible names: MD3 renders several destinations as
     // icon buttons, whose names live in aria-label/title rather than innerText.
-    const requiredText = ['FenxiDL', '新建下载', '所有下载', '正在下载', '已完成', '程序', '开始队列', '清理已完成'];
+    //
+    // File-type shortcuts live inside a collapsed "分类" group so the rail fits
+    // at small window heights, so they are asserted after expanding it rather
+    // than being expected in the initial render.
+    const requiredText = ['FenxiDL', '新建下载', '所有下载', '正在下载', '已完成', '分类', '开始队列', '清理已完成'];
     const missing = requiredText.filter((r) => !text.includes(r));
     if (missing.length > 0) throw new Error(`UI missing labels: ${missing.join(', ')}`);
+
+    // Expand the category group (a flyout panel beside the rail) and confirm every
+    // file-type destination is reachable.
+    await win.webContents.executeJavaScript(
+      `(() => { const b = document.querySelector('.md-nav-rail__item--group'); if (b) b.click(); return !!b; })()`,
+    );
+    await new Promise((r) => setTimeout(r, 400));
+    const panelText = (await win.webContents.executeJavaScript(
+      `document.querySelector('.md-rail-category-panel') ? document.querySelector('.md-rail-category-panel').innerText : ''`,
+    )) as string;
+    const requiredTypes = ['程序', '音乐', '视频', '游戏', '文档', '压缩文件', '其他'];
+    const missingTypes = requiredTypes.filter((r) => !panelText.includes(r));
+    if (missingTypes.length > 0) {
+      throw new Error(`Rail is missing file-type destinations: ${missingTypes.join(', ')}`);
+    }
+    // Close the panel again so later assertions see the default rail.
+    await win.webContents.executeJavaScript(
+      `(() => { const b = document.querySelector('.md-nav-rail__item--group'); if (b) b.click(); return !!b; })()`,
+    );
+    await new Promise((r) => setTimeout(r, 300));
 
     const interactiveNames = (await win.webContents.executeJavaScript(
       `Array.from(document.querySelectorAll('button')).map((b) => (b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '') + ' ' + b.innerText).join(' | ')`,
@@ -986,7 +1618,6 @@ async function runSmokeCheck(): Promise<void> {
     for (const d of dialogs) {
       const opened = await openByName(d.name);
       if (!opened) throw new Error('openByName returned false');
-      if (!opened) throw new Error(`Could not open dialog: ${d.name}`);
       const mounted = (await win.webContents.executeJavaScript(
         `document.querySelector('.md-dialog') ? document.querySelector('.md-dialog__headline').innerText : ''`,
       )) as string;
@@ -1052,14 +1683,20 @@ async function runAfterQueueAction(action: string): Promise<void> {
     cancelId: 1,
   });
   if (confirmed.response !== 0) return;
-  const { exec } = await import('node:child_process');
-  const command =
-    action === 'shutdown' ? 'shutdown /s /t 0'
-      : action === 'sleep' ? 'rundll32.exe powrprof.dll,SetSuspendState 0,1,0'
-        : action === 'hibernate' ? 'shutdown /h'
-          : action === 'hangup' ? 'rasdial /disconnect'
-            : '';
-  if (command) exec(command);
+  // The command table is fixed and selected by an enum, so nothing here can be
+  // steered by renderer data (V-18).
+  const { execFile } = await import('node:child_process');
+  const command: { file: string; args: string[] } | null =
+    action === 'shutdown' ? { file: 'shutdown', args: ['/s', '/t', '0'] }
+      : action === 'sleep' ? { file: 'rundll32.exe', args: ['powrprof.dll,SetSuspendState', '0,1,0'] }
+        : action === 'hibernate' ? { file: 'shutdown', args: ['/h'] }
+          : action === 'hangup' ? { file: 'rasdial', args: ['/disconnect'] }
+            : null;
+  if (command) {
+    execFile(command.file, command.args, (err) => {
+      if (err) broadcast('dl:log', `The ${label} command failed: ${err.message}`);
+    });
+  }
 }
 
 // Single-instance: a second launch focuses the existing window.
@@ -1080,12 +1717,9 @@ if (!gotLock) {
     app.quit();
   });
 
-  app.on('window-all-closed', () => {
-    // Keep running in the tray so scheduled queues can still fire.
-    if (process.platform !== 'darwin') {
-      // no-op: the tray owns the lifecycle
-    }
-  });
+  // Keep running in the tray so scheduled queues can still fire; the tray owns
+  // the window lifecycle and `before-quit` releases the services.
+  app.on('window-all-closed', () => undefined);
 
   app.on('before-quit', () => {
     void manager?.dispose();
@@ -1097,3 +1731,6 @@ if (!gotLock) {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 }
+
+// Exported for the smoke harness and for unit tests of the validation policy.
+export { isInternalRendererUrl, withheldCredentials as __withheldCredentials, validateGrabberProject as __validateGrabberProject, sanitizeVirusScan, CONNECTION_TYPE_IDS, LANGUAGE_IDS };
