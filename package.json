@@ -90,7 +90,8 @@
         }
       ],
       "artifactName": "${productName}-${version}-${arch}.${ext}",
-      "requestedExecutionLevel": "asInvoker"
+      "requestedExecutionLevel": "asInvoker",
+      "icon": "assets/icon.ico"
     },
     "nsis": {
       "oneClick": false,
