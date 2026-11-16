@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        width: 260px; margin: 0; padding: 14px;
+        font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+        background: #151a21; color: #e6ebf2; font-size: 13px;
+      }
+      h1 { font-size: 14px; margin: 0 0 10px; display: flex; align-items: center; gap: 7px; }
+      .mark {
+        width: 20px; height: 20px; border-radius: 5px;
+        background: linear-gradient(135deg, #4c8bf5, #7c5cf7);
+        display: grid; place-items: center; font-size: 11px; font-weight: 800; color: #fff;
+      }
+      .status { padding: 8px 10px; border-radius: 8px; background: #1b2129; border: 1px solid #242c36; margin-bottom: 10px; font-size: 12px; }
+      .status.ok { color: #35c07d; border-color: #1e4230; background: #12251b; }
+      .status.no { color: #e5534b; border-color: #4d2320; background: #2a1615; }
+      label { display: flex; align-items: center; gap: 8px; padding: 5px 0; color: #9aa7b8; cursor: pointer; }
+      label:hover { color: #e6ebf2; }
+      input[type="checkbox"] { accent-color: #4c8bf5; }
+      .hint { color: #6b7889; font-size: 11px; line-height: 1.6; margin-top: 8px; }
+    </style>
+  </head>
+  <body>
+    <h1><span class="mark">F</span> FenxiDL 集成</h1>
+    <div id="status" class="status">正在检查本地服务…</div>
+    <label><input type="checkbox" id="enabled" /> 接管浏览器下载</label>
+    <div class="hint">
+      启用后，浏览器的新下载会转交给 FenxiDL。关闭时仅报告媒体地址，不会中断浏览器自身的下载。
+    </div>
+    <script src="popup.js"></script>
+  </body>
+</html>

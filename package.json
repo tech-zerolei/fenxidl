@@ -1,0 +1,94 @@
+{
+  "name": "fenxi-dl",
+  "version": "1.0.0",
+  "description": "FenxiDL - multi-connection segmented download manager",
+  "main": "dist/main/index.js",
+  "author": "FenxiDL Project",
+  "license": "MIT",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build:main": "node build/build-main.mjs",
+    "build:renderer": "node build/build-renderer.mjs",
+    "build": "npm run typecheck && npm run build:main && npm run build:renderer",
+    "start": "npm run build && electron .",
+    "test": "node build/build-test.mjs && node --test dist/test/",
+    "dist:win": "npm run build && electron-builder --win --x64"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.17",
+    "@types/react-dom": "^18.3.5",
+    "electron": "^33.3.1",
+    "electron-builder": "^25.1.8",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "allowScripts": {
+    "electron@33.4.11": true,
+    "esbuild@0.24.2": true
+  },
+  "build": {
+    "appId": "com.fenxidl.downloadmanager",
+    "productName": "FenxiDL",
+    "copyright": "Copyright © 2026 FenxiDL Project",
+    "directories": {
+      "output": "release",
+      "buildResources": "assets"
+    },
+    "files": [
+      "dist/main/**/*",
+      "dist/renderer/**/*",
+      "!dist/test/**/*",
+      "package.json"
+    ],
+    "asar": true,
+    "compression": "maximum",
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "requestedExecutionLevel": "asInvoker"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "FenxiDL",
+      "uninstallDisplayName": "FenxiDL 下载管理器",
+      "deleteAppDataOnUninstall": false,
+      "installerLanguages": [
+        "zh_CN"
+      ],
+      "language": "2052",
+      "license": "assets/LICENSE.txt"
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-portable.${ext}"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Network"
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "FenxiDL Integration",
+  "version": "1.0.0",
+  "description": "Hands media and download requests to the local FenxiDL download manager.",
+  "permissions": ["downloads", "webRequest", "storage", "contextMenus"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Send to FenxiDL",
+    "default_popup": "popup.html"
+  },
+  "icons": {
+    "128": "icon128.png"
+  }
+}
