@@ -98,6 +98,20 @@ declare const __dirname: string;
 function applyRootSandboxWorkaround(): void {
   const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
   if (!isRoot) return;
+  // A launcher may have supplied the flag already (the AppImage AppRun does so
+  // for uid 0). In that case there is nothing to decide and nothing to warn
+  // about - reporting "refusing" here was a false alarm that made a working
+  // launch look like a security violation.
+  if (app.commandLine.hasSwitch('no-sandbox')) {
+    if (process.env.FENXI_ALLOW_NO_SANDBOX !== '1') {
+      console.warn(
+        '[FenxiDL] Running as root with --no-sandbox supplied by the launcher: ' +
+          'the Chromium sandbox is disabled. For best security, run the app as ' +
+          'a regular user.',
+      );
+    }
+    return;
+  }
   if (process.env.FENXI_ALLOW_NO_SANDBOX !== '1') {
     console.error(
       '[FenxiDL] Refusing to disable the Chromium sandbox automatically. ' +
@@ -106,7 +120,6 @@ function applyRootSandboxWorkaround(): void {
     );
     return;
   }
-  if (app.commandLine.hasSwitch('no-sandbox')) return;
   app.commandLine.appendSwitch('no-sandbox');
   if (!app.commandLine.hasSwitch('disable-gpu-sandbox')) {
     app.commandLine.appendSwitch('disable-gpu-sandbox');

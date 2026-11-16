@@ -27,6 +27,32 @@ function log(msg) {
   console.log(`patch-appimage: ${msg}`);
 }
 
+/**
+ * Remove the EULA that electron-builder copies into the AppImage root.
+ *
+ * app-builder-lib's `getNotLocalizedLicenseFile()` treats any `license.txt` /
+ * `eula.txt` inside `directories.buildResources` as an end-user licence
+ * agreement, copies it to the image root, and the generated AppRun then blocks
+ * startup with `zenity --text-info` until the user clicks Agree. In a headless
+ * or CI environment that dialog never returns, so the app appears to hang.
+ *
+ * The project's licence is still shipped, but from `resources/` under a name
+ * that does not match the EULA pattern. Removing the trigger here is a safety
+ * net: the primary fix is not placing a licence file in buildResources at all.
+ */
+function dropEula(dir) {
+  let removed = 0;
+  for (const name of ['LICENSE.txt', 'license.txt', 'EULA.txt', 'eula.txt']) {
+    const file = path.join(dir, name);
+    if (fs.existsSync(file)) {
+      fs.rmSync(file, { force: true });
+      removed += 1;
+    }
+  }
+  if (removed > 0) log(`removed ${removed} AppImage-root licence file(s) that would trigger an EULA prompt`);
+  return removed > 0;
+}
+
 function patchAppRun(dir) {
   const file = path.join(dir, 'AppRun');
   const text = fs.readFileSync(file, 'utf8');
@@ -112,7 +138,9 @@ function repack(appImagePath) {
 
     const root = path.join(work, 'root');
     execFileSync('unsquashfs', ['-q', '-n', '-d', root, payload], { stdio: 'pipe' });
-    if (!patchAppRun(root)) return;
+    const eulaDropped = dropEula(root);
+    const patched = patchAppRun(root);
+    if (!patched && !eulaDropped) return;
 
     const squash = path.join(work, 'new.squashfs');
     const comp = squashfsCompression(original, offset);
