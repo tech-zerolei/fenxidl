@@ -29,6 +29,7 @@
 - [测试与验证](#测试与验证)
 - [安全模型](#安全模型)
 - [设计说明](#设计说明)
+- [版本](#版本)
 - [许可证](#许可证)
 
 ---
@@ -299,8 +300,8 @@ npm run dist:win
 
 | 文件 | 说明 |
 | --- | --- |
-| `FenxiDL-1.0.0-x64.exe` | NSIS 安装程序（可改目录、建快捷方式、含卸载器） |
-| `FenxiDL-1.0.0-portable.exe` | 免安装单文件 |
+| `FenxiDL-1.1.0-x64.exe` | NSIS 安装程序（可改目录、建快捷方式、含卸载器） |
+| `FenxiDL-1.1.0-portable.exe` | 免安装单文件 |
 | `win-unpacked\FenxiDL.exe` | 解包目录，可直接运行 |
 
 详细步骤与故障排查见 [docs/BUILD-WINDOWS.md](docs/BUILD-WINDOWS.md)。
@@ -435,6 +436,27 @@ deb 包由 electron-builder 正确设置 `chrome-sandbox` 的 setuid 位，无�
 5. 界面为全新设计（Material Design 3），仅保留功能语义与信息架构。
 
 本项目与 Internet Download Manager 的发行方（Tonec Inc.）无任何关联、合作或背书关系。
+
+---
+
+## 版本
+
+当前版本 **1.1.0**。
+
+| 文档 | 内容 |
+| --- | --- |
+| [CHANGELOG.md](CHANGELOG.md) | 每个版本的变更、提交范围与已知问题 |
+| [VERSIONING.md](VERSIONING.md) | 版本号规则、数据格式兼容性、发布检查清单 |
+
+> **1.0.0 存在已知的数据完整性与安全缺陷**（可能产出全零坏文件、`updateTask` 可导致
+> 任意文件写）。请使用 **1.1.0 或更新版本**。
+
+把任意一次发布回溯到确切源码：
+
+```bash
+git checkout v1.1.0          # 该版本的确切源码
+git log --oneline v1.0.0..v1.1.0
+```
 
 ---
 

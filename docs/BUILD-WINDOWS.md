@@ -49,8 +49,8 @@ npm run dist:win
 
 | 文件 | 说明 |
 | --- | --- |
-| `FenxiDL-1.0.0-x64.exe` | **NSIS 安装程序**（可改安装目录、创建桌面与开始菜单快捷方式、含卸载器） |
-| `FenxiDL-1.0.0-portable.exe` | 免安装单文件版 |
+| `FenxiDL-1.1.0-x64.exe` | **NSIS 安装程序**（可改安装目录、创建桌面与开始菜单快捷方式、含卸载器） |
+| `FenxiDL-1.1.0-portable.exe` | 免安装单文件版 |
 | `win-unpacked\` | 解包后的程序目录，可直接运行 `FenxiDL.exe` |
 
 ## 三、不需要的东西

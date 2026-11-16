@@ -57,8 +57,8 @@ echo.
 
 echo ============================================
 echo   构建完成！产物在 release\ 目录：
-echo     FenxiDL-1.0.0-x64.exe          安装程序
-echo     FenxiDL-1.0.0-portable.exe     免安装版
+echo     FenxiDL-1.1.0-x64.exe          安装程序
+echo     FenxiDL-1.1.0-portable.exe     免安装版
 echo     win-unpacked\FenxiDL.exe       可直接运行
 echo ============================================
 dir /b release\*.exe 2>nul
