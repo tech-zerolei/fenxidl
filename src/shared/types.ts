@@ -251,6 +251,13 @@ export interface TaskCreateInput {
   queueId?: string | null;
   /** When true the task is created in `queued` state and not started. */
   addToQueueOnly?: boolean;
+  /**
+   * When true the task starts immediately regardless of the auto-start
+   * extension list. Set by an explicit "start now" action (the new-download
+   * dialog); omitted by automatic entry points (clipboard, extension) that
+   * want the allow-list policy to decide.
+   */
+  startNow?: boolean;
   /** Open the file with its default application on completion. */
   openWhenDone?: boolean;
 }

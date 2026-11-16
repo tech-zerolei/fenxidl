@@ -662,6 +662,7 @@ function registerIpc(): void {
       headers: sanitizeHeaderRecord(raw.headers, 'headers'),
       queueId: asStringOrNull(raw.queueId, 'queueId', 64),
       addToQueueOnly: raw.addToQueueOnly === true,
+      startNow: raw.startNow === true,
       openWhenDone: raw.openWhenDone === true,
     };
     if (input.directory && settings.useLastPathForGeneral) {
@@ -680,9 +681,20 @@ function registerIpc(): void {
       }
     }
     const task = requireManager().createTask(input);
-    // Honour the auto-start extension list (Options > General).
-    const autoStart = !input.addToQueueOnly && requireManager().shouldAutoStart(input.url);
-    if (autoStart) requireManager().start(task.id);
+    // Three states, because "no explicit instruction" is genuinely different
+    // from "start now":
+    //   addToQueueOnly          -> the user chose 加入队列, never start here
+    //   startNow                -> the user pressed 开始下载, always start
+    //   neither (clipboard/API) -> fall back to the extension allow-list
+    // Previously the allow-list gated every task, so pressing 开始下载 for a
+    // .bin / extension-less / ?id= URL added it and left it queued until the
+    // user also pressed 开始队列.
+    const startsNow = input.addToQueueOnly === true
+      ? false
+      : input.startNow === true
+        ? true
+        : requireManager().shouldAutoStart(input.url);
+    if (startsNow) requireManager().start(task.id);
     pushSnapshot();
     return ok(task);
   });

@@ -233,6 +233,35 @@ export function NumberField({
   help?: string;
 }): React.ReactElement {
   const id = useId();
+  // The input keeps its own draft string so the field can be emptied while
+  // typing. A controlled number value cannot represent "empty": deleting the
+  // last digit produced 0, which re-rendered as a literal "0" and made the
+  // caret jump in front of it, so the value could never be cleared.
+  const [draft, setDraft] = useState<string>(() => (Number.isFinite(value) ? String(value) : ''));
+  const [focused, setFocused] = useState(false);
+
+  // While focused the draft is authoritative; when the caller changes the value
+  // from outside (e.g. a reset), mirror it.
+  useEffect(() => {
+    if (!focused) setDraft(Number.isFinite(value) ? String(value) : '');
+  }, [value, focused]);
+
+  /**
+   * Push a draft string to the caller.
+   *
+   * An empty draft must stay empty *in the field* while the user is typing, so
+   * it deliberately does not call onChange: doing so re-rendered the value as
+   * the minimum and the caret jumped in front of it, which is why the field
+   * could never be cleared. Callers keep their numeric invariant because the
+   * last committed number is still theirs, and blur re-normalises the text.
+   */
+  const commit = (raw: string): void => {
+    if (raw.trim() === '') return;
+    const parsed = Number.parseInt(raw, 10);
+    if (!Number.isFinite(parsed)) return;
+    onChange(Math.min(max ?? Number.MAX_SAFE_INTEGER, Math.max(min ?? -Number.MAX_SAFE_INTEGER, parsed)));
+  };
+
   return (
     <div className="md-field">
       {label && (
@@ -243,19 +272,41 @@ export function NumberField({
       <input
         id={id}
         type="number"
-        value={Number.isFinite(value) ? value : 0}
+        inputMode="numeric"
+        value={draft}
         min={min}
         max={max}
         step={step}
         disabled={disabled}
+        aria-describedby={help ? `${id}-help` : undefined}
+        onFocus={() => setFocused(true)}
         onChange={(e) => {
-          const n = Number(e.target.value);
-          // An empty field is reported as 0 rather than NaN so callers keep a
-          // numeric invariant; clamping happens at the call site.
-          onChange(Number.isFinite(n) ? n : 0);
+          setDraft(e.target.value);
+          commit(e.target.value);
+        }}
+        onBlur={() => {
+          setFocused(false);
+          // Leaving the field empty shows the value that will actually be used
+          // (the last committed one), so the field never lies about the state.
+          if (draft.trim() === '') {
+            setDraft(Number.isFinite(value) ? String(value) : String(min ?? 0));
+            return;
+          }
+          const parsed = Number.parseInt(draft, 10);
+          if (Number.isFinite(parsed)) {
+            const clamped = Math.min(max ?? Number.MAX_SAFE_INTEGER, Math.max(min ?? -Number.MAX_SAFE_INTEGER, parsed));
+            setDraft(String(clamped));
+            if (clamped !== value) onChange(clamped);
+          } else {
+            setDraft(Number.isFinite(value) ? String(value) : String(min ?? 0));
+          }
         }}
       />
-      {help && <div className="md-field__help">{help}</div>}
+      {help && (
+        <div className="md-field__help" id={`${id}-help`}>
+          {help}
+        </div>
+      )}
     </div>
   );
 }

@@ -155,6 +155,10 @@ export function NewTaskDialog({
         referer: referer || null,
         queueId,
         addToQueueOnly,
+        // The button label already says 开始下载 / 加入队列, so make the intent
+        // explicit and let the main process honour it instead of re-deciding
+        // from the file extension.
+        startNow: !addToQueueOnly,
         openWhenDone,
       });
       onCreated();
