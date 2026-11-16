@@ -1,4 +1,8 @@
-# <img src="assets/icon.svg" width="40" align="top" alt=""> FenxiDL
+<p align="center">
+  <img src="docs/banner.png" alt="FenxiDL — 多线程分段下载管理器" width="100%">
+</p>
+
+# FenxiDL
 
 **多线程分段下载管理器** · 跨平台 · Material Design 3 界面
 
